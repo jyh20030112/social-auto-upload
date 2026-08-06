@@ -148,6 +148,64 @@ class BrowserCliParserTests(unittest.TestCase):
 
         self.assertEqual(args.thumbnail_landscape, landscape_path)
         self.assertEqual(args.thumbnail_portrait, portrait_path)
+        self.assertEqual(args.publish_timeout_seconds, 120)
+
+    def test_tencent_upload_video_accepts_publish_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+            args = sau_cli.build_parser().parse_args(
+                [
+                    "tencent",
+                    "upload-video",
+                    "--account",
+                    "creator",
+                    "--file",
+                    str(video_path),
+                    "--title",
+                    "标题",
+                    "--publish-timeout-seconds",
+                    "45",
+                ]
+            )
+        self.assertEqual(args.publish_timeout_seconds, 45)
+
+    def test_tencent_upload_video_rejects_too_short_short_title(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+            with self.assertRaises(SystemExit):
+                sau_cli.build_parser().parse_args(
+                    [
+                        "tencent",
+                        "upload-video",
+                        "--account",
+                        "creator",
+                        "--file",
+                        str(video_path),
+                        "--title",
+                        "标题",
+                        "--short-title",
+                        "海鸥",
+                    ]
+                )
+
+    def test_tencent_login_accepts_cookie_import(self):
+        args = sau_cli.build_parser().parse_args(
+            [
+                "tencent",
+                "login",
+                "--account",
+                "creator",
+                "--cookie_import",
+                "wxuin=123456;sessionid=test%2Fsession",
+            ]
+        )
+        self.assertEqual(args.cookie_import, "wxuin=123456;sessionid=test%2Fsession")
+
+    def test_tencent_login_cookie_import_defaults_none(self):
+        args = sau_cli.build_parser().parse_args(["tencent", "login", "--account", "creator"])
+        self.assertIsNone(args.cookie_import)
 
     def test_kuaishou_upload_note_accepts_title_and_note(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -398,7 +456,79 @@ class DouyinCookieImportTests(unittest.TestCase):
         self.assertEqual(result["origins"], raw["origins"])
 
 
+class TencentCookieImportTests(unittest.TestCase):
+    def test_convert_raw_cookie_fields_to_storage_state(self):
+        result = sau_cli.convert_tencent_cookie_header_to_storage_state(
+            "wxuin=123456;sessionid=test%2Fsession"
+        )
+
+        self.assertEqual(result["origins"], [])
+        self.assertEqual(
+            [cookie["name"] for cookie in result["cookies"]],
+            ["sessionid", "wxuin"],
+        )
+        self.assertEqual(result["cookies"][0]["value"], "test%2Fsession")
+        self.assertTrue(
+            all(
+                cookie["domain"] == "channels.weixin.qq.com"
+                and cookie["expires"] == -1
+                and cookie["secure"]
+                and cookie["sameSite"] == "None"
+                for cookie in result["cookies"]
+            )
+        )
+
+    def test_convert_requires_both_cookie_fields(self):
+        with self.assertRaisesRegex(ValueError, "sessionid"):
+            sau_cli.convert_tencent_cookie_header_to_storage_state("wxuin=123456")
+
+
 class BrowserCliDispatchTests(unittest.TestCase):
+    def test_dispatch_tencent_login_import_cookie_success(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            account_file = Path(tmp_dir) / "tencent_creator.json"
+            args = Namespace(
+                platform="tencent",
+                action="login",
+                account="creator",
+                headless=True,
+                cookie_import="wxuin=123456;sessionid=test%2Fsession",
+            )
+            with patch("sau_cli.resolve_account_file", return_value=account_file), patch(
+                "sau_cli.tencent_cookie_auth", new=AsyncMock(return_value=True)
+            ) as mock_auth:
+                code = asyncio.run(sau_cli.dispatch(args))
+
+            self.assertEqual(code, 0)
+            written = json.loads(account_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [cookie["name"] for cookie in written["cookies"]],
+                ["sessionid", "wxuin"],
+            )
+            validated_path = Path(mock_auth.await_args.args[0])
+            self.assertNotEqual(validated_path, account_file)
+            self.assertFalse(validated_path.exists())
+
+    def test_tencent_cookie_import_failure_preserves_existing_account(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            account_file = Path(tmp_dir) / "tencent_creator.json"
+            original = '{"cookies": [{"name": "existing"}], "origins": []}'
+            account_file.write_text(original, encoding="utf-8")
+
+            with patch("sau_cli.resolve_account_file", return_value=account_file), patch(
+                "sau_cli.tencent_cookie_auth", new=AsyncMock(return_value=False)
+            ):
+                result = asyncio.run(
+                    sau_cli.login_tencent_account(
+                        "creator",
+                        cookie_import="wxuin=123456;sessionid=invalid",
+                    )
+                )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(account_file.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(Path(tmp_dir).glob("*.importing")), [])
+
     def test_dispatch_douyin_login_import_cookie_success(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             cookie_file = Path(tmp_dir) / "export.json"
@@ -493,6 +623,7 @@ class BrowserCliDispatchTests(unittest.TestCase):
             schedule=0,
             debug=False,
             headless=True,
+            publish_timeout_seconds=45,
         )
         with patch("sau_cli.upload_note", new=AsyncMock()) as mock_upload:
             asyncio.run(sau_cli.dispatch(args))
@@ -546,6 +677,7 @@ class BrowserCliDispatchTests(unittest.TestCase):
             draft=False,
             debug=False,
             headless=True,
+            publish_timeout_seconds=45,
         )
         with patch("sau_cli.upload_tencent_video", new=AsyncMock()) as mock_upload:
             asyncio.run(sau_cli.dispatch(args))
@@ -553,6 +685,7 @@ class BrowserCliDispatchTests(unittest.TestCase):
         request = mock_upload.await_args.args[0]
         self.assertEqual(request.thumbnail_landscape_file, Path("landscape.png"))
         self.assertEqual(request.thumbnail_portrait_file, Path("portrait.png"))
+        self.assertEqual(request.publish_timeout_seconds, 45)
 
     def test_dispatch_xiaohongshu_upload_video_uses_headed_request(self):
         args = Namespace(

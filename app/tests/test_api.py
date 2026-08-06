@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 from app.src.config import Settings
 from app.src.main import create_app
 
-
 HEX_UUID = re.compile(r"^[0-9a-f]{32}$")
 PREFIX = "/api/v1/douyin"
 
@@ -85,31 +84,38 @@ class DouyinApiTest(unittest.TestCase):
         referenced_files = specification["components"]["schemas"][referenced_name]["properties"]["files"]
         self.assertEqual(referenced_files["items"]["format"], "binary")
 
-    def test_login_returns_queued_hex_task_id(self) -> None:
+    def test_login_callback_mode_returns_queued_hex_task_id(self) -> None:
         cookie = json.dumps(
             [{"name": "sessionid", "value": "demo", "domain": ".douyin.com", "path": "/"}]
         )
         response = self.client.post(
             f"{PREFIX}/accounts/login",
-            json={"account": "alice", "cookie": cookie},
+            json={
+                "account": "alice",
+                "cookie": cookie,
+                "callback_url": "https://callback.example.com/douyin",
+            },
         )
         self.assertEqual(response.status_code, 202, response.text)
         task = response.json()["data"]
-        self.assertRegex(task["id"], HEX_UUID)
+        self.assertRegex(task["task_id"], HEX_UUID)
         self.assertEqual(task["status"], "queued")
-        self.assertEqual(task["operation"], "login")
 
-        query = self.client.get(f"{PREFIX}/tasks/{task['id']}", params={"account": "alice"})
+        query = self.client.get(f"{PREFIX}/tasks/{task['task_id']}", params={"account": "alice"})
         self.assertEqual(query.status_code, 200, query.text)
-        self.assertEqual(query.json()["data"]["id"], task["id"])
+        self.assertEqual(query.json()["data"]["id"], task["task_id"])
 
         cancel = self.client.post(
-            f"{PREFIX}/tasks/{task['id']}/cancel",
+            f"{PREFIX}/tasks/{task['task_id']}/cancel",
             json={"account": "alice"},
         )
         self.assertEqual(cancel.status_code, 200, cancel.text)
-        self.assertEqual(cancel.json()["data"]["status"], "cancelled")
-        self.assertFalse((self.settings.temporary_dir / f"{task['id']}.cookie.json").exists())
+        cancelled = cancel.json()["data"]
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["callbacks"][0]["event"], "cancelled")
+        self.assertEqual(cancelled["callbacks"][0]["status"], "pending")
+        self.assertRegex(cancelled["callbacks"][0]["event_id"], HEX_UUID)
+        self.assertFalse((self.settings.temporary_dir / f"{task['task_id']}.cookie.json").exists())
 
     def test_login_accepts_raw_browser_cookie_header(self) -> None:
         response = self.client.post(
@@ -117,10 +123,11 @@ class DouyinApiTest(unittest.TestCase):
             json={
                 "account": "raw_cookie_user",
                 "cookie": "sessionid=example-value; sid_tt=value-with-equals==",
+                "callback_url": "https://callback.example.com/douyin",
             },
         )
         self.assertEqual(response.status_code, 202, response.text)
-        task_id = response.json()["data"]["id"]
+        task_id = response.json()["data"]["task_id"]
         temporary_cookie = self.settings.temporary_dir / f"{task_id}.cookie.json"
         storage_state = json.loads(temporary_cookie.read_text(encoding="utf-8"))
         cookies = {item["name"]: item for item in storage_state["cookies"]}
@@ -154,6 +161,45 @@ class DouyinApiTest(unittest.TestCase):
         self.assertTrue(second["deduplicated"])
         self.assertNotEqual(other["id"], first["id"])
 
+    def test_material_callback_mode_stages_files_and_returns_task_id(self) -> None:
+        response = self.client.post(
+            f"{PREFIX}/materials",
+            data={
+                "account": "alice",
+                "callback_url": "https://callback.example.com/materials",
+            },
+            files=[("files", ("clip.mp4", b"fake-video", "video/mp4"))],
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        task_id = response.json()["data"]["task_id"]
+        self.assertRegex(task_id, HEX_UUID)
+        staging_dir = self.settings.task_staging_dir / task_id
+        self.assertTrue(staging_dir.is_dir())
+        self.assertEqual(len(list(staging_dir.iterdir())), 1)
+
+        query = self.client.get(f"{PREFIX}/tasks/{task_id}", params={"account": "alice"})
+        self.assertEqual(query.status_code, 200, query.text)
+        self.assertEqual(query.json()["data"]["operation"], "upload_materials")
+
+        cancel = self.client.post(
+            f"{PREFIX}/tasks/{task_id}/cancel",
+            json={"account": "alice"},
+        )
+        self.assertEqual(cancel.status_code, 200, cancel.text)
+        self.assertFalse(staging_dir.exists())
+
+    def test_callback_url_requires_http_or_https(self) -> None:
+        response = self.client.post(
+            f"{PREFIX}/accounts/login",
+            json={
+                "account": "alice",
+                "cookie": "sessionid=example",
+                "callback_url": "ftp://callback.example.com/result",
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(response.json()["error"]["code"], "VALIDATION_ERROR")
+
     def test_video_publish_idempotency_and_account_isolation(self) -> None:
         self._mark_logged_in("alice")
         video = self._upload("alice", "clip.mp4", b"fake-video", "video/mp4")
@@ -166,23 +212,24 @@ class DouyinApiTest(unittest.TestCase):
         }
         headers = {"Idempotency-Key": "video-001"}
 
-        first = self.client.post(f"{PREFIX}/publish/video", json=body, headers=headers)
-        replay = self.client.post(f"{PREFIX}/publish/video", json=body, headers=headers)
+        body["callback_url"] = "https://callback.example.com/douyin"
+        first = self.client.post(f"{PREFIX}/video", json=body, headers=headers)
+        replay = self.client.post(f"{PREFIX}/video", json=body, headers=headers)
         self.assertEqual(first.status_code, 202, first.text)
         self.assertEqual(replay.status_code, 202, replay.text)
         first_task = first.json()["data"]
         replay_task = replay.json()["data"]
-        self.assertRegex(first_task["id"], HEX_UUID)
-        self.assertEqual(first_task["id"], replay_task["id"])
+        self.assertRegex(first_task["task_id"], HEX_UUID)
+        self.assertEqual(first_task["task_id"], replay_task["task_id"])
         self.assertTrue(replay_task["idempotent_replay"])
 
         changed = dict(body, title="changed title")
-        conflict = self.client.post(f"{PREFIX}/publish/video", json=changed, headers=headers)
+        conflict = self.client.post(f"{PREFIX}/video", json=changed, headers=headers)
         self.assertEqual(conflict.status_code, 409, conflict.text)
         self.assertEqual(conflict.json()["error"]["code"], "IDEMPOTENCY_CONFLICT")
 
         hidden = self.client.get(
-            f"{PREFIX}/tasks/{first_task['id']}",
+            f"{PREFIX}/tasks/{first_task['task_id']}",
             params={"account": "bob"},
         )
         self.assertEqual(hidden.status_code, 404, hidden.text)
@@ -197,7 +244,7 @@ class DouyinApiTest(unittest.TestCase):
         self._mark_logged_in("alice")
         image = self._upload("alice", "note.png", b"fake-image", "image/png")
         response = self.client.post(
-            f"{PREFIX}/publish/note",
+            f"{PREFIX}/note",
             json={
                 "account": "alice",
                 "image_material_ids": [image["id"]],
@@ -209,17 +256,23 @@ class DouyinApiTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "VALIDATION_ERROR")
 
         accepted = self.client.post(
-            f"{PREFIX}/publish/note",
+            f"{PREFIX}/note",
             json={
                 "account": "alice",
                 "image_material_ids": [image["id"]],
                 "title": "note title",
                 "note": "note body",
+                "callback_url": "https://callback.example.com/douyin",
             },
             headers={"Idempotency-Key": "note-001"},
         )
         self.assertEqual(accepted.status_code, 202, accepted.text)
-        self.assertRegex(accepted.json()["data"]["id"], HEX_UUID)
+        self.assertRegex(accepted.json()["data"]["task_id"], HEX_UUID)
+
+        self.assertEqual(
+            self.client.post(f"{PREFIX}/publish/note", json={}).status_code,
+            404,
+        )
 
     def test_missing_account_check_does_not_launch_browser(self) -> None:
         response = self.client.post(f"{PREFIX}/accounts/check", json={"account": "missing"})

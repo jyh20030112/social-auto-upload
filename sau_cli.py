@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,7 @@ from uploader.douyin_uploader.main import (
     DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
     DouYinNote,
     DouYinVideo,
+    _build_login_result,
     cookie_auth as douyin_cookie_auth,
     douyin_setup,
 )
@@ -218,8 +220,126 @@ def parse_schedule(raw_schedule: str | None) -> datetime | int:
     return datetime.strptime(raw_schedule, SCHEDULE_FORMAT)
 
 
-async def login_douyin_account(account_name: str, headless: bool = True) -> dict:
+def _normalize_same_site(raw: object, secure: bool) -> str:
+    """Map browser-extension / Playwright sameSite values to Playwright's
+    canonical 'Strict'|'Lax'|'None'. Downgrade None->Lax when not secure,
+    because Chromium/Playwright rejects SameSite=None cookies without Secure."""
+    if raw is None:
+        return "Lax"
+    value = {
+        "no_restriction": "None",
+        "none": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+        "unspecified": "Lax",
+    }.get(str(raw).lower(), "Lax")
+    if value == "None" and not secure:
+        return "Lax"
+    return value
+
+
+def convert_extension_cookies_to_storage_state(raw_json: object) -> dict:
+    """Convert a browser-extension-exported cookie JSON (Cookie-Editor /
+    EditThisCookie array) into a Playwright storage_state dict:
+    {"cookies": [...], "origins": []}.
+
+    Also accepts an already-normalized storage_state dict (top-level
+    "cookies" key) as passthrough. Only cookies whose domain contains
+    "douyin.com" are kept. Raises ValueError on unrecognized shapes or
+    when no douyin cookies remain.
+    """
+    if isinstance(raw_json, list):
+        raw_cookies = raw_json
+        origins: list = []
+    elif isinstance(raw_json, dict) and "cookies" in raw_json:
+        raw_cookies = raw_json["cookies"]
+        origins = raw_json.get("origins", [])
+    else:
+        raise ValueError(
+            "cookie 文件格式无法识别：需要 cookie 数组（扩展导出）或 storage_state 对象（Playwright 导出）"
+        )
+
+    converted: list[dict] = []
+    for cookie in raw_cookies:
+        if not isinstance(cookie, dict):
+            continue
+        domain = str(cookie.get("domain") or "")
+        if "douyin.com" not in domain:
+            continue
+        secure = bool(cookie.get("secure", False))
+
+        if "expirationDate" in cookie or "session" in cookie:
+            # Browser-extension export format.
+            if cookie.get("session", False) or cookie.get("expirationDate") is None:
+                expires = -1
+            else:
+                try:
+                    expires = float(cookie["expirationDate"])
+                except (TypeError, ValueError):
+                    expires = -1
+            same_site = _normalize_same_site(cookie.get("sameSite"), secure)
+        else:
+            # Playwright storage_state format (already normalized keys).
+            raw_expires = cookie.get("expires", -1)
+            if isinstance(raw_expires, (int, float)) and not isinstance(raw_expires, bool):
+                expires = float(raw_expires)
+            else:
+                expires = -1
+            same_site = _normalize_same_site(cookie.get("sameSite"), secure)
+
+        converted.append({
+            "name": str(cookie.get("name", "")),
+            "value": str(cookie.get("value", "")),
+            "domain": domain,
+            "path": str(cookie.get("path", "/")),
+            "expires": expires,
+            "httpOnly": bool(cookie.get("httpOnly", False)),
+            "secure": secure,
+            "sameSite": same_site,
+        })
+
+    if not converted:
+        raise ValueError("cookie 文件中没有 douyin.com 域名的 cookie，请确认已在浏览器登录抖音后导出")
+
+    return {"cookies": converted, "origins": origins}
+
+
+async def _import_douyin_cookie(account_file: Path, cookie_file: Path) -> dict:
+    """Read a browser-extension cookie export, convert + filter to storage_state,
+    write it to account_file, and validate with the existing douyin cookie_auth.
+    Never falls back to QR login."""
+    try:
+        raw_json = json.loads(cookie_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return _build_login_result(False, "failed", f"cookie 文件不是有效 JSON: {cookie_file}（{exc}）", account_file)
+    except OSError as exc:
+        return _build_login_result(False, "failed", f"无法读取 cookie 文件: {cookie_file}（{exc}）", account_file)
+
+    try:
+        storage_state = convert_extension_cookies_to_storage_state(raw_json)
+    except ValueError as exc:
+        return _build_login_result(False, "cookie_invalid", str(exc), account_file)
+
+    try:
+        account_file.write_text(json.dumps(storage_state, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        return _build_login_result(False, "failed", f"无法写入账号文件: {account_file}（{exc}）", account_file)
+
+    if not await douyin_cookie_auth(str(account_file)):
+        return _build_login_result(
+            False,
+            "cookie_invalid",
+            "导入的 cookie 校验失败：cookie 可能已过期或缺少登录态，请重新在浏览器导出",
+            account_file,
+        )
+
+    return _build_login_result(True, "cookie_valid", "cookie 导入成功并通过校验", account_file)
+
+
+async def login_douyin_account(account_name: str, headless: bool = True, cookie_file: Path | None = None) -> dict:
     account_file = resolve_account_file("douyin", account_name)
+    if cookie_file is not None:
+        return await _import_douyin_cookie(account_file, cookie_file)
     return await douyin_setup(str(account_file), handle=True, return_detail=True, headless=headless)
 
 
@@ -588,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
         action_parser = douyin_actions.add_parser(action_name, help=f"Douyin {action_name}")
         action_parser.add_argument("--account", required=True, help="Douyin user-defined account_name")
         if action_name == "login":
+            action_parser.add_argument(
+                "--cookie-file",
+                type=existing_file_path,
+                help="Import cookies from a browser-extension-exported JSON file (Cookie-Editor / EditThisCookie format) instead of QR login",
+            )
             add_runtime_flags(action_parser)
 
     upload_video_parser = douyin_actions.add_parser("upload-video", help="Upload one video to Douyin")
@@ -742,10 +867,17 @@ def build_parser() -> argparse.ArgumentParser:
 async def dispatch(args: argparse.Namespace) -> int:
     if args.platform == "douyin":
         if args.action == "login":
-            result = await login_douyin_account(args.account, headless=args.headless)
+            result = await login_douyin_account(
+                args.account,
+                headless=args.headless,
+                cookie_file=args.cookie_file,
+            )
             if not result["success"]:
                 raise RuntimeError(result["message"])
-            print(f"Douyin login flow completed: {result['account_file']}")
+            if args.cookie_file is not None:
+                print(f"Douyin cookie imported and validated: {result['account_file']}")
+            else:
+                print(f"Douyin login flow completed: {result['account_file']}")
             return 0
 
         if args.action == "check":

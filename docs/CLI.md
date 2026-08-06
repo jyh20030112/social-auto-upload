@@ -52,6 +52,21 @@ sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title 
 sau douyin upload-note --account <account_name> --images videos/1.png videos/2.png --title "图文标题" --note "图文示例" --tags 图文,测试
 ```
 
+### 通过浏览器插件 Cookie 导入登录
+
+如果不想走扫码登录，可以直接导入浏览器插件导出的 cookie：
+
+```bash
+sau douyin login --account <account_name> --cookie-file /path/to/exported_cookies.json
+```
+
+- `--cookie-file` 接受浏览器插件导出的 cookie JSON（Cookie-Editor / EditThisCookie 格式的 cookie 数组；也兼容 Playwright 导出的 `{"cookies": [...]}` storage_state 文件）
+- 只会保留 `domain` 包含 `douyin.com` 的 cookie，转换后写入 `cookies/douyin_<account_name>.json`，结构与扫码登录保存的文件完全一致
+- 写入后会复用既有的 `cookie_auth` 校验登录态：
+  - 校验通过 → 打印 `Douyin cookie imported and validated: ...`，退出码 0
+  - 校验失败 / 文件中没有 douyin cookie / JSON 无效 → 打印清晰错误，退出码 1
+- 导入路径不会回退到二维码登录；cookie 无效时请重新在浏览器登录抖音后导出
+
 抖音短信验证码补充说明：
 
 - 视频发布过程中如果触发短信二次验证，CLI 会优先读取项目根目录下的 `verify_code.txt`

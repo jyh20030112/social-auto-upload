@@ -21,6 +21,16 @@ dependencies = [
 sau = "sau_cli:main"
 
 [project.optional-dependencies]
+api = [
+  "aiosqlite>=0.21.0",
+  "fastapi>=0.116.0",
+  "python-multipart>=0.0.20",
+  "sqlalchemy>=2.0.41",
+  "uvicorn[standard]>=0.35.0",
+]
+test = [
+  "httpx>=0.28.1",
+]
 web = [
   "Flask[async]==3.1.1",
   "flask-cors==6.0.0",
@@ -34,7 +44,7 @@ py-modules = ["cli_main", "conf", "sau_cli"]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["uploader*", "utils*", "myUtils*"]
+include = ["app*", "uploader*", "utils*", "myUtils*"]
 
 [tool.setuptools.package-data]
 utils = ["stealth.min.js"]

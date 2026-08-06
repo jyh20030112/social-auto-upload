@@ -5,6 +5,7 @@
 - `douyin`
 - `kuaishou`
 - `xiaohongshu`
+- `tencent`
 - `bilibili`
 
 实现说明：
@@ -31,6 +32,7 @@ uv pip install -e .
 sau douyin --help
 sau kuaishou --help
 sau xiaohongshu --help
+sau tencent --help
 sau bilibili --help
 ```
 
@@ -97,6 +99,35 @@ sau xiaohongshu upload-note --account <account_name> --images videos/1.png video
 ```bash
 SAU_XHS_CREATOR_BASE_URL=https://creator.rednote.com sau xiaohongshu login --account <account_name>
 ```
+
+## 视频号 CLI 子命令
+
+```bash
+sau tencent login --account <account_name>
+sau tencent check --account <account_name>
+sau tencent upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags 视频号,测试
+```
+
+`--short-title` 为可选参数；传入时必须为 6—16 个字符。主标题不足 6 个字符且未传短标题时，CLI 会保留短标题为空，不再使用空格补齐。
+
+视频号点击“发表”后默认最多等待 120 秒确认结果。该动作只点击一次，避免平台响应较慢时重复提交；可按需调整：
+
+```bash
+sau tencent upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --publish-timeout-seconds 180
+```
+
+超时会生成 `debug_tencent_publish_failure.png`，并提示平台端结果未知。此时应先在内容管理中确认结果，不要立即重复发布。
+
+如果已经取得视频号助手的 `wxuin` 和 `sessionid`，可以跳过扫码，直接导入：
+
+```bash
+sau tencent login --account <account_name> --cookie_import 'wxuin=<wxuin>;sessionid=<sessionid>'
+```
+
+- 两个字段都必须提供，并且整段参数必须使用引号包住，避免分号被 shell 解释。
+- CLI 会先将 Cookie 写入临时文件并调用现有登录态检查；校验成功后才替换账号文件。
+- 校验失败不会覆盖已有账号文件，也不会自动回退到扫码登录。
+- Cookie 通过命令行参数传入时可能保留在 shell 历史中，只应在可信本机环境使用。
 
 ## Bilibili CLI 子命令
 

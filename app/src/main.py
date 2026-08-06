@@ -14,15 +14,15 @@ from app.src.config import Settings
 from app.src.container import build_container
 from app.src.domain.errors import ApiError
 
-API_PREFIX = "/api/v1/douyin"
+API_PREFIX = "/api/v1"
 logger = logging.getLogger(__name__)
 
 OPENAPI_DESCRIPTION = """
-# 抖音自动发布 API
 
-提供抖音账号 Cookie 登录、登录态检查、素材管理、视频/图文发布以及任务管理。
+在同一个服务中提供抖音与视频号账号 Cookie 登录、登录态检查、素材管理、内容发布和任务管理。
 
-- 所有业务路由前缀为 `/api/v1/douyin`。
+- 平台路由使用 `/api/v1/douyin` 与 `/api/v1/shipin`，素材、任务和健康检查为通用路由。
+- 除健康检查外，所有业务接口必须传 `X-User-ID`，用于隔离 Cookie、素材、任务和幂等键。
 - 登录、素材上传、视频和图文接口未传 `callback_url` 时同步等待并直接返回业务结果。
 - 传入 `callback_url` 时返回异步任务 ID，并向该 HTTP/HTTPS 地址回调任务事件。
 - 遇到短信验证码时返回或回调 `waiting_verification`，通过验证码接口提交后继续执行。
@@ -38,8 +38,12 @@ OPENAPI_DESCRIPTION = """
 OPENAPI_TAGS = [
     {
         "name": "douyin",
-        "description": "抖音账号、素材、内容发布、任务与服务健康检查接口。",
-    }
+        "description": "抖音账号、视频、图文和验证码接口。",
+    },
+    {"name": "shipin", "description": "视频号账号和视频发布接口。"},
+    {"name": "materials", "description": "用户隔离的通用素材接口。"},
+    {"name": "tasks", "description": "跨平台通用任务查询与取消接口。"},
+    {"name": "health", "description": "无需用户标识的存活与就绪检查。"},
 ]
 
 
@@ -105,9 +109,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await container.database.close()
 
     application = FastAPI(
-        title="抖音自动发布 API",
+        title="自媒体自动发布 API",
         description=OPENAPI_DESCRIPTION,
-        version="1.0.0",
+        version="2.0.0",
         openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
     )
@@ -129,7 +133,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.exception_handler(ApiError)
     async def handle_api_error(request: Request, exc: ApiError):
-        return _error_response(request, exc.status_code, exc.code, exc.message, exc.details)
+        return _error_response(
+            request, exc.status_code, exc.code, exc.message, exc.details
+        )
 
     @application.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, exc: RequestValidationError):
@@ -160,11 +166,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception):
-        logger.exception("Unhandled Douyin API error", exc_info=exc)
+        logger.exception("Unhandled social publishing API error", exc_info=exc)
         return _error_response(request, 500, "INTERNAL_ERROR", "服务器内部错误")
 
-    for router in (accounts.router, materials.router, publishing.router, tasks.router, health.router):
-        application.include_router(router, prefix=API_PREFIX)
+    application.include_router(accounts.douyin_router, prefix=f"{API_PREFIX}/douyin")
+    application.include_router(publishing.douyin_router, prefix=f"{API_PREFIX}/douyin")
+    application.include_router(tasks.douyin_router, prefix=f"{API_PREFIX}/douyin")
+    application.include_router(accounts.shipin_router, prefix=f"{API_PREFIX}/shipin")
+    application.include_router(publishing.shipin_router, prefix=f"{API_PREFIX}/shipin")
+    application.include_router(materials.router, prefix=API_PREFIX)
+    application.include_router(tasks.router, prefix=API_PREFIX)
+    application.include_router(health.router, prefix=API_PREFIX)
 
     default_openapi = application.openapi
 

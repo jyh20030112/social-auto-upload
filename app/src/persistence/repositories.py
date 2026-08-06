@@ -63,6 +63,8 @@ def _queue_callback(
                 "event_id": event_id,
                 "event": event_type,
                 "task_id": task.id,
+                "user_id": task.user_id,
+                "platform": task.platform,
                 "operation": task.operation,
                 "account": task.account,
                 "status": task.status,
@@ -81,12 +83,21 @@ class Repository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    async def upsert_account(self, account: str, cookie_path: str | None, status: str) -> AccountRecord:
+    async def upsert_account(
+        self,
+        user_id: str,
+        platform: str,
+        account: str,
+        cookie_path: str | None,
+        status: str,
+    ) -> AccountRecord:
         async with self.database.session_factory() as session:
-            record = await session.get(AccountRecord, account)
+            record = await session.get(AccountRecord, (user_id, platform, account))
             now = utc_now()
             if record is None:
                 record = AccountRecord(
+                    user_id=user_id,
+                    platform=platform,
                     account=account,
                     cookie_path=cookie_path,
                     status=status,
@@ -103,29 +114,29 @@ class Repository:
             await session.refresh(record)
             return record
 
-    async def get_account(self, account: str) -> AccountRecord | None:
+    async def get_account(self, user_id: str, platform: str, account: str) -> AccountRecord | None:
         async with self.database.session_factory() as session:
-            return await session.get(AccountRecord, account)
+            return await session.get(AccountRecord, (user_id, platform, account))
 
     async def get_material(self, material_id: str) -> MaterialRecord | None:
         async with self.database.session_factory() as session:
             return await session.get(MaterialRecord, material_id)
 
-    async def get_material_for_account(self, material_id: str, account: str) -> MaterialRecord | None:
+    async def get_material_for_user(self, material_id: str, user_id: str) -> MaterialRecord | None:
         async with self.database.session_factory() as session:
             result = await session.execute(
                 select(MaterialRecord).where(
                     MaterialRecord.id == material_id,
-                    MaterialRecord.account == account,
+                    MaterialRecord.user_id == user_id,
                 )
             )
             return result.scalar_one_or_none()
 
-    async def get_material_by_hash(self, account: str, sha256: str) -> MaterialRecord | None:
+    async def get_material_by_hash(self, user_id: str, sha256: str) -> MaterialRecord | None:
         async with self.database.session_factory() as session:
             result = await session.execute(
                 select(MaterialRecord).where(
-                    MaterialRecord.account == account,
+                    MaterialRecord.user_id == user_id,
                     MaterialRecord.sha256 == sha256,
                 )
             )
@@ -138,19 +149,19 @@ class Repository:
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
-                existing = await self.get_material_by_hash(record.account, record.sha256)
+                existing = await self.get_material_by_hash(record.user_id, record.sha256)
                 if existing is None:
                     raise
                 return existing
             await session.refresh(record)
             return record
 
-    async def delete_material_record(self, material_id: str, account: str) -> bool:
+    async def delete_material_record(self, material_id: str, user_id: str) -> bool:
         async with self.database.session_factory() as session:
             result = await session.execute(
                 delete(MaterialRecord).where(
                     MaterialRecord.id == material_id,
-                    MaterialRecord.account == account,
+                    MaterialRecord.user_id == user_id,
                 )
             )
             await session.commit()
@@ -172,7 +183,9 @@ class Repository:
         self,
         *,
         task_id: str,
-        account: str,
+        user_id: str,
+        platform: str | None,
+        account: str | None,
         operation: str,
         payload: dict,
         material_ids: Iterable[str] = (),
@@ -182,6 +195,8 @@ class Repository:
         async with self.database.session_factory() as session:
             task = TaskRecord(
                 id=task_id,
+                user_id=user_id,
+                platform=platform,
                 account=account,
                 operation=operation,
                 status=TaskStatus.QUEUED.value,
@@ -211,10 +226,19 @@ class Repository:
             await session.refresh(task)
             return task
 
-    async def find_idempotent_task(self, account: str, operation: str, key: str) -> TaskRecord | None:
+    async def find_idempotent_task(
+        self,
+        user_id: str,
+        platform: str,
+        account: str,
+        operation: str,
+        key: str,
+    ) -> TaskRecord | None:
         async with self.database.session_factory() as session:
             result = await session.execute(
                 select(TaskRecord).where(
+                    TaskRecord.user_id == user_id,
+                    TaskRecord.platform == platform,
                     TaskRecord.account == account,
                     TaskRecord.operation == operation,
                     TaskRecord.idempotency_key == key,
@@ -222,11 +246,11 @@ class Repository:
             )
             return result.scalar_one_or_none()
 
-    async def get_task(self, task_id: str, account: str | None = None) -> TaskRecord | None:
+    async def get_task(self, task_id: str, user_id: str | None = None) -> TaskRecord | None:
         async with self.database.session_factory() as session:
             statement = select(TaskRecord).where(TaskRecord.id == task_id)
-            if account is not None:
-                statement = statement.where(TaskRecord.account == account)
+            if user_id is not None:
+                statement = statement.where(TaskRecord.user_id == user_id)
             result = await session.execute(statement)
             return result.scalar_one_or_none()
 
@@ -352,11 +376,14 @@ class Repository:
             _queue_callback(session, task, status.value, now)
             await session.commit()
 
-    async def request_task_cancel(self, task_id: str, account: str) -> TaskRecord | None:
+    async def request_task_cancel(self, task_id: str, user_id: str) -> TaskRecord | None:
         async with self.database.session_factory() as session:
             task = (
                 await session.execute(
-                    select(TaskRecord).where(TaskRecord.id == task_id, TaskRecord.account == account)
+                    select(TaskRecord).where(
+                        TaskRecord.id == task_id,
+                        TaskRecord.user_id == user_id,
+                    )
                 )
             ).scalar_one_or_none()
             if task is None:

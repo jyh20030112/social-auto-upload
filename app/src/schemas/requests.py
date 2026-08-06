@@ -6,6 +6,7 @@ from typing import Annotated
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
+    ConfigDict,
     Field,
     StringConstraints,
     field_validator,
@@ -15,7 +16,12 @@ from pydantic import (
 AccountName = Annotated[
     str,
     StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$", strip_whitespace=True),
-    Field(description="抖音账号名称，1—64 位，只允许字母、数字、下划线和连字符"),
+    Field(description="平台账号名称，1—64 位，只允许字母、数字、下划线和连字符"),
+]
+UserId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$", strip_whitespace=True),
+    Field(description="用户标识，1—64 位，只允许字母、数字、下划线和连字符"),
 ]
 HexId = Annotated[
     str,
@@ -63,6 +69,22 @@ class LoginRequest(BaseModel):
 
 class CheckRequest(BaseModel):
     account: AccountName
+
+
+class ShipinLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account: AccountName
+    cookie: str = Field(
+        min_length=2,
+        max_length=8 * 1024 * 1024,
+        description="视频号原始 Cookie，必须包含 wxuin 和 sessionid",
+        examples=["wxuin=123456;sessionid=example"],
+    )
+    callback_url: AnyHttpUrl | None = Field(
+        default=None,
+        description="可选回调地址；提供后接口立即返回任务 ID，结果通过 HTTP POST 回调",
+    )
 
 
 class VideoPublishRequest(BaseModel):
@@ -177,14 +199,70 @@ class NotePublishRequest(BaseModel):
         return value
 
 
-class VerificationCodeRequest(BaseModel):
+class ShipinVideoPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     account: AccountName
+    video_material_id: HexId = Field(description="通用素材接口返回的视频素材 ID")
+    title: str = Field(min_length=1, description="视频标题")
+    description: str = Field(default="", description="视频描述")
+    tags: list[str] = Field(default_factory=list, description="话题标签列表")
+    schedule: datetime | None = Field(
+        default=None,
+        description="定时发布时间；必须包含时区且至少晚于当前时间 2 小时",
+    )
+    thumbnail_landscape_material_id: HexId | None = Field(
+        default=None,
+        description="可选的 4:3 横版封面素材 ID",
+    )
+    thumbnail_portrait_material_id: HexId | None = Field(
+        default=None,
+        description="可选的 3:4 竖版封面素材 ID",
+    )
+    short_title: str | None = Field(
+        default=None,
+        min_length=6,
+        max_length=16,
+        description="可选的视频号短标题，长度必须为 6-16 个字符",
+    )
+    category: str | None = Field(default=None, description="可选的原创内容分类")
+    callback_url: AnyHttpUrl | None = Field(
+        default=None,
+        description="可选回调地址；提供后异步返回任务结果",
+    )
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_tags(cls, value: list[str]) -> list[str]:
+        return _normalize_tags(value)
+
+    @field_validator("schedule")
+    @classmethod
+    def validate_schedule(cls, value: datetime | None) -> datetime | None:
+        return _validate_schedule(value)
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title 不能为空")
+        return value
+
+    @field_validator("short_title")
+    @classmethod
+    def strip_short_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not 6 <= len(value) <= 16:
+            raise ValueError("short_title 长度必须为 6-16 个字符")
+        return value
+
+
+class VerificationCodeRequest(BaseModel):
     code: Annotated[
         str,
         StringConstraints(pattern=r"^[0-9]{4,8}$"),
         Field(description="抖音短信验证码，4—8 位数字", examples=["123456"]),
     ]
-
-
-class CancelTaskRequest(BaseModel):
-    account: AccountName

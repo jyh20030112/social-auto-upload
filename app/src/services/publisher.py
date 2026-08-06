@@ -10,9 +10,13 @@ from app.src.persistence.repositories import Repository
 from sau_cli import (
     DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
     DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
+    TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
+    TENCENT_PUBLISH_STRATEGY_SCHEDULED,
     DouyinNoteUploadRequest,
     DouyinVideoUploadRequest,
+    TencentVideoUploadRequest,
     upload_note,
+    upload_tencent_video,
     upload_video,
 )
 
@@ -28,22 +32,25 @@ def _platform_schedule(raw: str | None) -> datetime | int:
     return value.astimezone(ZoneInfo("Asia/Shanghai"))
 
 
-class PublisherService:
+class _BasePublisherService:
     def __init__(self, settings: Settings, repository: Repository) -> None:
         self.settings = settings
         self.repository = repository
 
-    async def _material_path(self, account: str, material_id: str) -> Path:
-        material = await self.repository.get_material_for_account(material_id, account)
+    async def _material_path(self, user_id: str, material_id: str) -> Path:
+        material = await self.repository.get_material_for_user(material_id, user_id)
         if material is None:
-            raise RuntimeError(f"素材不存在或不属于账号 {account}: {material_id}")
+            raise RuntimeError(f"素材不存在或不属于用户 {user_id}: {material_id}")
         path = Path(material.stored_path)
         if not path.exists():
             raise RuntimeError(f"素材文件已丢失: {material_id}")
         return path
 
+
+class DouyinPublisherService(_BasePublisherService):
     async def publish_video(
         self,
+        user_id: str,
         account: str,
         payload: dict,
         progress: ProgressCallback,
@@ -55,13 +62,17 @@ class PublisherService:
             if schedule != 0
             else DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
         )
-        video = await self._material_path(account, payload["video_material_id"])
+        video = await self._material_path(user_id, payload["video_material_id"])
         landscape = None
         portrait = None
         if payload.get("thumbnail_landscape_material_id"):
-            landscape = await self._material_path(account, payload["thumbnail_landscape_material_id"])
+            landscape = await self._material_path(
+                user_id, payload["thumbnail_landscape_material_id"]
+            )
         if payload.get("thumbnail_portrait_material_id"):
-            portrait = await self._material_path(account, payload["thumbnail_portrait_material_id"])
+            portrait = await self._material_path(
+                user_id, payload["thumbnail_portrait_material_id"]
+            )
 
         await upload_video(
             DouyinVideoUploadRequest(
@@ -79,16 +90,17 @@ class PublisherService:
                 publish_strategy=strategy,
                 debug=self.settings.debug,
                 headless=self.settings.headless,
-                account_file=self.settings.cookies_dir / f"douyin_{account}.json",
+                account_file=self.settings.cookies_dir / user_id / f"douyin_{account}.json",
                 progress_callback=progress,
                 verification_code_provider=verification_provider,
                 publish_timeout_seconds=self.settings.video_timeout_seconds,
             )
         )
-        return {"account": account, "operation": "publish_video"}
+        return {"account": account, "platform": "douyin", "operation": "publish_video"}
 
     async def publish_note(
         self,
+        user_id: str,
         account: str,
         payload: dict,
         progress: ProgressCallback,
@@ -101,7 +113,7 @@ class PublisherService:
             else DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
         )
         images = [
-            await self._material_path(account, material_id)
+            await self._material_path(user_id, material_id)
             for material_id in payload["image_material_ids"]
         ]
         await upload_note(
@@ -116,10 +128,63 @@ class PublisherService:
                 debug=self.settings.debug,
                 headless=self.settings.headless,
                 bgm=payload.get("bgm", ""),
-                account_file=self.settings.cookies_dir / f"douyin_{account}.json",
+                account_file=self.settings.cookies_dir / user_id / f"douyin_{account}.json",
                 progress_callback=progress,
                 verification_code_provider=verification_provider,
                 publish_timeout_seconds=self.settings.note_timeout_seconds,
             )
         )
-        return {"account": account, "operation": "publish_note"}
+        return {"account": account, "platform": "douyin", "operation": "publish_note"}
+
+
+class ShipinPublisherService(_BasePublisherService):
+    async def publish_video(
+        self,
+        user_id: str,
+        account: str,
+        payload: dict,
+        progress: ProgressCallback,
+    ) -> dict:
+        schedule = _platform_schedule(payload.get("schedule"))
+        strategy = (
+            TENCENT_PUBLISH_STRATEGY_SCHEDULED
+            if schedule != 0
+            else TENCENT_PUBLISH_STRATEGY_IMMEDIATE
+        )
+        video = await self._material_path(user_id, payload["video_material_id"])
+        landscape = None
+        portrait = None
+        if payload.get("thumbnail_landscape_material_id"):
+            landscape = await self._material_path(
+                user_id, payload["thumbnail_landscape_material_id"]
+            )
+        if payload.get("thumbnail_portrait_material_id"):
+            portrait = await self._material_path(
+                user_id, payload["thumbnail_portrait_material_id"]
+            )
+        await upload_tencent_video(
+            TencentVideoUploadRequest(
+                account_name=account,
+                video_file=video,
+                title=payload["title"],
+                description=payload.get("description", ""),
+                tags=payload.get("tags", []),
+                publish_date=schedule,
+                thumbnail_landscape_file=landscape,
+                thumbnail_portrait_file=portrait,
+                short_title=payload.get("short_title"),
+                category=payload.get("category"),
+                is_draft=False,
+                publish_strategy=strategy,
+                debug=self.settings.debug,
+                headless=self.settings.shipin_headless,
+                account_file=self.settings.cookies_dir / user_id / f"shipin_{account}.json",
+                publish_timeout_seconds=self.settings.shipin_publish_timeout_seconds,
+                progress_callback=progress,
+            )
+        )
+        return {"account": account, "platform": "shipin", "operation": "publish_video"}
+
+
+# Preserve the old import name for callers outside the API package.
+PublisherService = DouyinPublisherService

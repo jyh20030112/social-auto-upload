@@ -31,11 +31,16 @@ class Settings:
     callback_timeout_seconds: int = 10
     verification_timeout_seconds: int = 300
     check_timeout_seconds: int = 90
+    shipin_login_timeout_seconds: int = 180
+    shipin_video_timeout_seconds: int = 1800
+    shipin_publish_timeout_seconds: int = 120
+    shipin_check_timeout_seconds: int = 90
     shutdown_grace_seconds: int = 30
     terminal_retention_days: int = 7
     worker_enabled: bool = True
     debug: bool = False
     headless: bool = True
+    shipin_headless: bool = True
 
     @property
     def cookies_dir(self) -> Path:
@@ -77,11 +82,25 @@ class Settings:
             callback_timeout_seconds=_positive_int("SAU_API_CALLBACK_TIMEOUT_SECONDS", 10),
             verification_timeout_seconds=_positive_int("SAU_API_VERIFICATION_TIMEOUT_SECONDS", 300),
             check_timeout_seconds=_positive_int("SAU_API_CHECK_TIMEOUT_SECONDS", 90),
+            shipin_login_timeout_seconds=_positive_int(
+                "SAU_API_SHIPIN_LOGIN_TIMEOUT_SECONDS", 180
+            ),
+            shipin_video_timeout_seconds=_positive_int(
+                "SAU_API_SHIPIN_VIDEO_TIMEOUT_SECONDS", 1800
+            ),
+            shipin_publish_timeout_seconds=_positive_int(
+                "SAU_API_SHIPIN_PUBLISH_TIMEOUT_SECONDS", 120
+            ),
+            shipin_check_timeout_seconds=_positive_int(
+                "SAU_API_SHIPIN_CHECK_TIMEOUT_SECONDS", 90
+            ),
             shutdown_grace_seconds=_positive_int("SAU_API_SHUTDOWN_GRACE_SECONDS", 30),
             terminal_retention_days=_positive_int("SAU_API_TERMINAL_RETENTION_DAYS", 7),
             worker_enabled=os.getenv("SAU_API_WORKER_ENABLED", "true").lower() not in {"0", "false", "no"},
             debug=os.getenv("SAU_API_DEBUG", "false").lower() in {"1", "true", "yes"},
             headless=os.getenv("SAU_API_HEADLESS", "true").lower() not in {"0", "false", "no"},
+            shipin_headless=os.getenv("SAU_API_SHIPIN_HEADLESS", "true").lower()
+            not in {"0", "false", "no"},
         )
 
     def with_overrides(self, **changes) -> Settings:

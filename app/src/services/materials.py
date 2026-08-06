@@ -58,7 +58,7 @@ class MaterialService:
                 output.write(chunk)
         return size, digest.hexdigest()
 
-    async def save_one(self, account: str, upload: UploadFile) -> dict:
+    async def save_one(self, user_id: str, upload: UploadFile) -> dict:
         original_name = Path(upload.filename or "").name
         extension, kind, size_limit = self._classify(original_name)
 
@@ -71,18 +71,18 @@ class MaterialService:
                 temporary_path,
                 size_limit,
             )
-            existing = await self.repository.get_material_by_hash(account, sha256)
+            existing = await self.repository.get_material_by_hash(user_id, sha256)
             if existing is not None and Path(existing.stored_path).exists():
                 return self.serialize(existing, deduplicated=True)
 
-            account_dir = self.settings.materials_dir / account
-            account_dir.mkdir(parents=True, exist_ok=True)
-            stored_path = account_dir / f"{sha256}{extension}"
+            user_dir = self.settings.materials_dir / user_id
+            user_dir.mkdir(parents=True, exist_ok=True)
+            stored_path = user_dir / f"{sha256}{extension}"
             os.replace(temporary_path, stored_path)
             record = await self.repository.add_material(
                 MaterialRecord(
                     id=uuid4().hex,
-                    account=account,
+                    user_id=user_id,
                     original_name=original_name,
                     stored_path=str(stored_path),
                     kind=kind,
@@ -101,7 +101,7 @@ class MaterialService:
             if temporary_path.exists():
                 temporary_path.unlink()
 
-    async def save_many(self, account: str, uploads: list[UploadFile]) -> dict:
+    async def save_many(self, user_id: str, uploads: list[UploadFile]) -> dict:
         if not uploads:
             raise ApiError(422, "MATERIALS_REQUIRED", "至少上传一个素材")
         if len(uploads) > 35:
@@ -110,7 +110,7 @@ class MaterialService:
         succeeded = 0
         for upload in uploads:
             try:
-                material = await self.save_one(account, upload)
+                material = await self.save_one(user_id, upload)
                 items.append({"success": True, "material": material})
                 succeeded += 1
             except ApiError as exc:
@@ -131,7 +131,7 @@ class MaterialService:
 
     async def stage_many(
         self,
-        account: str,
+        user_id: str,
         uploads: list[UploadFile],
         callback_url: str,
     ):
@@ -193,7 +193,9 @@ class MaterialService:
 
             return await self.repository.create_task(
                 task_id=task_id,
-                account=account,
+                user_id=user_id,
+                platform=None,
+                account=None,
                 operation=TaskOperation.UPLOAD_MATERIALS.value,
                 payload={
                     "callback_url": callback_url,
@@ -205,7 +207,7 @@ class MaterialService:
             shutil.rmtree(task_dir, ignore_errors=True)
             raise
 
-    async def process_staged(self, account: str, payload: dict) -> dict:
+    async def process_staged(self, user_id: str, payload: dict) -> dict:
         results: list[dict] = []
         succeeded = 0
         try:
@@ -240,7 +242,7 @@ class MaterialService:
                         headers=Headers({"content-type": item.get("content_type") or "application/octet-stream"}),
                     )
                     try:
-                        material = await self.save_one(account, upload)
+                        material = await self.save_one(user_id, upload)
                         results.append({"success": True, "material": material})
                         succeeded += 1
                     except ApiError as exc:
@@ -271,8 +273,8 @@ class MaterialService:
         if staging_dir:
             shutil.rmtree(Path(staging_dir), ignore_errors=True)
 
-    async def delete(self, account: str, material_id: str) -> None:
-        material = await self.repository.get_material_for_account(material_id, account)
+    async def delete(self, user_id: str, material_id: str) -> None:
+        material = await self.repository.get_material_for_user(material_id, user_id)
         if material is None:
             return
         if await self.repository.material_has_active_task(material_id):
@@ -285,7 +287,7 @@ class MaterialService:
             os.replace(source, trash)
             moved = True
         try:
-            await self.repository.delete_material_record(material_id, account)
+            await self.repository.delete_material_record(material_id, user_id)
         except Exception:
             if moved and trash.exists():
                 os.replace(trash, source)
@@ -297,7 +299,7 @@ class MaterialService:
     def serialize(record: MaterialRecord, *, deduplicated: bool = False) -> dict:
         return {
             "id": record.id,
-            "account": record.account,
+            "user_id": record.user_id,
             "filename": record.original_name,
             "kind": record.kind,
             "extension": record.extension,

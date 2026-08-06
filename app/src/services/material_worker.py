@@ -87,7 +87,7 @@ class MaterialWorker:
                 "正在校验、去重并保存素材",
             )
             async with asyncio.timeout(self.settings.material_timeout_seconds):
-                result = await self.materials.process_staged(record.account, record.payload)
+                result = await self.materials.process_staged(record.user_id, record.payload)
             await self.repository.finish_task(task_id, TaskStatus.SUCCEEDED, result=result)
         except asyncio.CancelledError:
             self.materials.cleanup_staged(record.payload)

@@ -4,58 +4,31 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Request
 
-from app.src.api.dependencies import get_container
+from app.src.api.dependencies import get_container, get_user_id
 from app.src.container import AppContainer
-from app.src.schemas.requests import CheckRequest, LoginRequest
-from app.src.schemas.responses import (
-    ApiErrorEnvelope,
-    ApiSuccessEnvelope,
-    success_response,
-)
+from app.src.domain.states import Platform
+from app.src.schemas.requests import CheckRequest, LoginRequest, ShipinLoginRequest
+from app.src.schemas.responses import ApiErrorEnvelope, ApiSuccessEnvelope, success_response
 
-router = APIRouter(prefix="/accounts", tags=["douyin"])
+douyin_router = APIRouter(prefix="/accounts", tags=["douyin"])
+shipin_router = APIRouter(prefix="/accounts", tags=["shipin"])
 
 
-@router.post(
-    "/login",
-    response_model=ApiSuccessEnvelope,
-    operation_id="douyin_account",
-    summary="抖音账号",
-    description=(
-        "接收浏览器请求头中的原始 Cookie 字符串，也支持 Cookie-Editor 导出数组"
-        "或 Playwright storage_state 对象的 JSON 字符串。未传 callback_url 时等待校验"
-        "完成并直接返回结果；传入 callback_url 时返回任务 ID，并在完成后回调。"
-        "校验成功后 Cookie 会按账号长期保存。"
-    ),
-    response_description="登录结果；异步模式下为任务受理结果",
-    responses={
-        202: {"model": ApiSuccessEnvelope, "description": "异步任务已受理，或正在等待短信验证码"},
-        422: {"model": ApiErrorEnvelope, "description": "Cookie 格式或请求参数无效"},
-        500: {"model": ApiErrorEnvelope, "description": "登录校验失败"},
-        504: {"model": ApiErrorEnvelope, "description": "登录校验超时"},
-    },
-)
-async def login(
-    body: LoginRequest,
+async def _submit_login(
+    *,
+    user_id: str,
+    platform: Platform,
+    body: LoginRequest | ShipinLoginRequest,
     request: Request,
-    container: Annotated[AppContainer, Depends(get_container)],
-    idempotency_key: Annotated[
-        str | None,
-        Header(
-            alias="Idempotency-Key",
-            max_length=128,
-            description="可选的登录任务幂等键",
-        ),
-    ] = None,
+    container: AppContainer,
+    idempotency_key: str | None,
 ):
-    task, reused = await container.tasks.submit_login(body, idempotency_key)
+    task, reused = await container.tasks.submit_login(
+        user_id, platform, body, idempotency_key
+    )
     if body.callback_url is not None:
         return success_response(
-            {
-                "task_id": task.id,
-                "status": task.status,
-                "idempotent_replay": reused,
-            },
+            {"task_id": task.id, "status": task.status, "idempotent_replay": reused},
             request.state.request_id,
             status_code=202,
         )
@@ -63,21 +36,89 @@ async def login(
     return success_response(data, request.state.request_id, status_code=status_code)
 
 
-@router.post(
+@douyin_router.post(
+    "/login",
+    response_model=ApiSuccessEnvelope,
+    operation_id="douyin_account_login",
+    summary="导入抖音 Cookie",
+    responses={202: {"model": ApiSuccessEnvelope}, 422: {"model": ApiErrorEnvelope}},
+)
+async def douyin_login(
+    body: LoginRequest,
+    request: Request,
+    user_id: Annotated[str, Depends(get_user_id)],
+    container: Annotated[AppContainer, Depends(get_container)],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", max_length=128, description="可选的登录任务幂等键"),
+    ] = None,
+):
+    return await _submit_login(
+        user_id=user_id,
+        platform=Platform.DOUYIN,
+        body=body,
+        request=request,
+        container=container,
+        idempotency_key=idempotency_key,
+    )
+
+
+@douyin_router.post(
     "/check",
     response_model=ApiSuccessEnvelope,
     summary="检查抖音登录态",
-    description="同步调用抖音 Cookie 鉴权逻辑，检查指定账号的已保存 Cookie 是否有效。",
-    response_description="账号登录状态",
-    responses={
-        422: {"model": ApiErrorEnvelope, "description": "请求参数无效"},
-        504: {"model": ApiErrorEnvelope, "description": "抖音登录态检查超时"},
-    },
 )
-async def check(
+async def douyin_check(
     body: CheckRequest,
     request: Request,
+    user_id: Annotated[str, Depends(get_user_id)],
     container: Annotated[AppContainer, Depends(get_container)],
 ):
-    data = await container.accounts.check(body.account)
+    data = await container.accounts.check(user_id, body.account)
     return success_response(data, request.state.request_id)
+
+
+@shipin_router.post(
+    "/login",
+    response_model=ApiSuccessEnvelope,
+    operation_id="shipin_account_login",
+    summary="导入视频号 Cookie",
+    description="传入包含 wxuin 和 sessionid 的原始 Cookie，校验成功后按用户和账号保存。",
+)
+async def shipin_login(
+    body: ShipinLoginRequest,
+    request: Request,
+    user_id: Annotated[str, Depends(get_user_id)],
+    container: Annotated[AppContainer, Depends(get_container)],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", max_length=128, description="可选的登录任务幂等键"),
+    ] = None,
+):
+    return await _submit_login(
+        user_id=user_id,
+        platform=Platform.SHIPIN,
+        body=body,
+        request=request,
+        container=container,
+        idempotency_key=idempotency_key,
+    )
+
+
+@shipin_router.post(
+    "/check",
+    response_model=ApiSuccessEnvelope,
+    summary="检查视频号登录态",
+)
+async def shipin_check(
+    body: CheckRequest,
+    request: Request,
+    user_id: Annotated[str, Depends(get_user_id)],
+    container: Annotated[AppContainer, Depends(get_container)],
+):
+    data = await container.shipin_accounts.check(user_id, body.account)
+    return success_response(data, request.state.request_id)
+
+
+# Kept as a module-level alias for code that imported the former router directly.
+router = douyin_router

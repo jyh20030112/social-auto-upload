@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from app.src.config import Settings
 from app.src.persistence.database import Database
 from app.src.persistence.repositories import Repository
-from app.src.services.accounts import AccountService
+from app.src.services.accounts import DouyinAccountService, ShipinAccountService
+from app.src.services.browser_coordinator import BrowserCoordinator
 from app.src.services.callback_worker import CallbackWorker
 from app.src.services.material_worker import MaterialWorker
 from app.src.services.materials import MaterialService
-from app.src.services.publisher import PublisherService
+from app.src.services.publisher import DouyinPublisherService, ShipinPublisherService
 from app.src.services.task_worker import TaskWorker
 from app.src.services.tasks import TaskService
 from app.src.services.verification import VerificationHub
@@ -20,9 +21,12 @@ class AppContainer:
     settings: Settings
     database: Database
     repository: Repository
-    accounts: AccountService
+    accounts: DouyinAccountService
+    shipin_accounts: ShipinAccountService
     materials: MaterialService
-    publisher: PublisherService
+    publisher: DouyinPublisherService
+    shipin_publisher: ShipinPublisherService
+    browser_coordinator: BrowserCoordinator
     verification: VerificationHub
     tasks: TaskService
     worker: TaskWorker
@@ -33,12 +37,30 @@ class AppContainer:
 def build_container(settings: Settings) -> AppContainer:
     database = Database(settings.database_url)
     repository = Repository(database)
-    accounts = AccountService(settings, repository)
+    browser_coordinator = BrowserCoordinator(settings.max_browser_tasks)
+    accounts = DouyinAccountService(settings, repository, browser_coordinator)
+    shipin_accounts = ShipinAccountService(settings, repository, browser_coordinator)
     materials = MaterialService(settings, repository)
-    publisher = PublisherService(settings, repository)
+    publisher = DouyinPublisherService(settings, repository)
+    shipin_publisher = ShipinPublisherService(settings, repository)
     verification = VerificationHub()
-    tasks = TaskService(settings, repository, accounts, verification)
-    worker = TaskWorker(settings, repository, accounts, publisher, verification)
+    tasks = TaskService(
+        settings,
+        repository,
+        accounts,
+        shipin_accounts,
+        verification,
+    )
+    worker = TaskWorker(
+        settings,
+        repository,
+        accounts,
+        shipin_accounts,
+        publisher,
+        shipin_publisher,
+        browser_coordinator,
+        verification,
+    )
     material_worker = MaterialWorker(settings, repository, materials)
     callback_worker = CallbackWorker(settings, repository)
     tasks.worker = worker
@@ -48,8 +70,11 @@ def build_container(settings: Settings) -> AppContainer:
         database=database,
         repository=repository,
         accounts=accounts,
+        shipin_accounts=shipin_accounts,
         materials=materials,
         publisher=publisher,
+        shipin_publisher=shipin_publisher,
+        browser_coordinator=browser_coordinator,
         verification=verification,
         tasks=tasks,
         worker=worker,

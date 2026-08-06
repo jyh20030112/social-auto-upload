@@ -33,6 +33,8 @@ class SchemaVersionRecord(Base):
 class AccountRecord(Base):
     __tablename__ = "accounts"
 
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16), primary_key=True)
     account: Mapped[str] = mapped_column(String(64), primary_key=True)
     cookie_path: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="missing", nullable=False)
@@ -45,10 +47,10 @@ class AccountRecord(Base):
 
 class MaterialRecord(Base):
     __tablename__ = "materials"
-    __table_args__ = (UniqueConstraint("account", "sha256", name="uq_material_account_sha256"),)
+    __table_args__ = (UniqueConstraint("user_id", "sha256", name="uq_material_user_sha256"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    account: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     original_name: Mapped[str] = mapped_column(Text, nullable=False)
     stored_path: Mapped[str] = mapped_column(Text, nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -62,11 +64,20 @@ class MaterialRecord(Base):
 class TaskRecord(Base):
     __tablename__ = "tasks"
     __table_args__ = (
-        UniqueConstraint("account", "operation", "idempotency_key", name="uq_task_idempotency"),
+        UniqueConstraint(
+            "user_id",
+            "platform",
+            "account",
+            "operation",
+            "idempotency_key",
+            name="uq_task_idempotency",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    account: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    platform: Mapped[str | None] = mapped_column(String(16), index=True)
+    account: Mapped[str | None] = mapped_column(String(64), index=True)
     operation: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     stage: Mapped[str] = mapped_column(String(64), nullable=False)

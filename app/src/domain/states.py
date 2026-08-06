@@ -3,6 +3,11 @@ from __future__ import annotations
 from enum import StrEnum
 
 
+class Platform(StrEnum):
+    DOUYIN = "douyin"
+    SHIPIN = "shipin"
+
+
 class TaskStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"

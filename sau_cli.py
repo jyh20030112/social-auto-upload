@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Awaitable, Callable, Iterable, Sequence
 
 from conf import BASE_DIR
 from uploader.bilibili_uploader.runtime import run_biliup_command
@@ -69,6 +69,10 @@ class DouyinVideoUploadRequest:
     debug: bool = True
     headless: bool = True
     declaration: str | None = None
+    account_file: Path | None = None
+    progress_callback: Callable[[str, str], Awaitable[None] | None] | None = None
+    verification_code_provider: Callable[[], Awaitable[str]] | None = None
+    publish_timeout_seconds: int | None = None
 
 
 @dataclass(slots=True)
@@ -83,6 +87,10 @@ class DouyinNoteUploadRequest:
     debug: bool = True
     headless: bool = True
     bgm: str = ""
+    account_file: Path | None = None
+    progress_callback: Callable[[str, str], Awaitable[None] | None] | None = None
+    verification_code_provider: Callable[[], Awaitable[str]] | None = None
+    publish_timeout_seconds: int | None = None
 
 
 @dataclass(slots=True)
@@ -453,8 +461,8 @@ async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> Path:
 
 
 async def upload_video(request: DouyinVideoUploadRequest) -> Path:
-    account_file = resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False)
+    account_file = request.account_file or resolve_account_file("douyin", request.account_name)
+    is_ready = await douyin_setup(str(account_file), handle=False, headless=request.headless)
     if not is_ready:
         raise RuntimeError(
             f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
@@ -479,14 +487,17 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        progress_callback=request.progress_callback,
+        verification_code_provider=request.verification_code_provider,
+        publish_timeout_seconds=request.publish_timeout_seconds,
     )
     await app.douyin_upload_video()
     return account_file
 
 
 async def upload_note(request: DouyinNoteUploadRequest) -> Path:
-    account_file = resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False)
+    account_file = request.account_file or resolve_account_file("douyin", request.account_name)
+    is_ready = await douyin_setup(str(account_file), handle=False, headless=request.headless)
     if not is_ready:
         raise RuntimeError(
             f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
@@ -503,6 +514,9 @@ async def upload_note(request: DouyinNoteUploadRequest) -> Path:
         debug=request.debug,
         headless=request.headless,
         bgm=request.bgm,
+        progress_callback=request.progress_callback,
+        verification_code_provider=request.verification_code_provider,
+        publish_timeout_seconds=request.publish_timeout_seconds,
     )
     await app.douyin_upload_note()
     return account_file
@@ -912,8 +926,9 @@ async def dispatch(args: argparse.Namespace) -> int:
         if args.action == "upload-note":
             # 如果指定了 --notef，读取文件内容作为 note
             note_content = args.note
-            if args.notef:
-                note_file = Path(args.notef)
+            note_file_arg = getattr(args, "notef", "")
+            if note_file_arg:
+                note_file = Path(note_file_arg)
                 if not note_file.exists():
                     print(f"错误：文件不存在: {note_file}", file=sys.stderr)
                     return 1
@@ -929,7 +944,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
-                bgm=args.bgm or "",
+                bgm=getattr(args, "bgm", "") or "",
             )
             await upload_note(request)
             print(f"Douyin note upload submitted: {len(request.image_files)} images")

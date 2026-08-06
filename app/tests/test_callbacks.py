@@ -12,7 +12,8 @@ from app.src.config import Settings
 from app.src.domain.states import TaskStage, TaskStatus
 from app.src.persistence.database import Database
 from app.src.persistence.repositories import Repository
-from app.src.services.accounts import AccountService
+from app.src.services.accounts import DouyinAccountService, ShipinAccountService
+from app.src.services.browser_coordinator import BrowserCoordinator
 from app.src.services.callback_worker import CallbackWorker
 from app.src.services.material_worker import MaterialWorker
 from app.src.services.materials import MaterialService
@@ -41,6 +42,8 @@ class CallbackWorkerTest(unittest.IsolatedAsyncioTestCase):
     async def test_waiting_and_final_events_are_persisted_and_delivered(self) -> None:
         task = await self.repository.create_task(
             task_id="a" * 32,
+            user_id="user_a",
+            platform="douyin",
             account="alice",
             operation="publish_video",
             payload={"callback_url": "https://callback.example.com/result"},
@@ -62,6 +65,8 @@ class CallbackWorkerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.event_type for item in callbacks], ["waiting_verification", "succeeded"])
         self.assertEqual(callbacks[0].payload["verification_expires_at"], expires_at.isoformat().replace("+00:00", "Z"))
         self.assertEqual(callbacks[1].payload["result"], {"published": True})
+        self.assertEqual(callbacks[0].payload["user_id"], "user_a")
+        self.assertEqual(callbacks[0].payload["platform"], "douyin")
         due = await self.repository.list_due_callbacks()
         self.assertEqual([item.id for item in due], [callbacks[0].id])
 
@@ -87,14 +92,18 @@ class CallbackWorkerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0].headers["X-Task-ID"], task.id)
 
     async def test_synchronous_wait_returns_business_result_or_verification_state(self) -> None:
+        coordinator = BrowserCoordinator(self.settings.max_browser_tasks)
         service = TaskService(
             self.settings.with_overrides(worker_enabled=True),
             self.repository,
-            AccountService(self.settings, self.repository),
+            DouyinAccountService(self.settings, self.repository, coordinator),
+            ShipinAccountService(self.settings, self.repository, coordinator),
             VerificationHub(),
         )
         succeeded_task = await self.repository.create_task(
             task_id="b" * 32,
+            user_id="user_a",
+            platform="douyin",
             account="alice",
             operation="login",
             payload={},
@@ -116,6 +125,8 @@ class CallbackWorkerTest(unittest.IsolatedAsyncioTestCase):
 
         waiting_task = await self.repository.create_task(
             task_id="c" * 32,
+            user_id="user_a",
+            platform="douyin",
             account="alice",
             operation="publish_note",
             payload={},
@@ -140,7 +151,9 @@ class CallbackWorkerTest(unittest.IsolatedAsyncioTestCase):
         staged_path.write_bytes(b"video-content")
         task = await self.repository.create_task(
             task_id=task_id,
-            account="alice",
+            user_id="user_a",
+            platform=None,
+            account=None,
             operation="upload_materials",
             payload={
                 "callback_url": "https://callback.example.com/materials",

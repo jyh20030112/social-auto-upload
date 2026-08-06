@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Sequence
+from uuid import uuid4
 
 from conf import BASE_DIR
 from uploader.bilibili_uploader.runtime import run_biliup_command
@@ -33,6 +34,7 @@ from uploader.tencent_uploader.main import (
     TENCENT_PUBLISH_STRATEGY_SCHEDULED,
     TencentVideo,
     cookie_auth as tencent_cookie_auth,
+    normalize_tencent_short_title,
     tencent_setup,
 )
 from uploader.xiaohongshu_uploader.main import (
@@ -176,6 +178,9 @@ class TencentVideoUploadRequest:
     publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    account_file: Path | None = None
+    publish_timeout_seconds: float = 120
+    progress_callback: Callable[[str, str], Awaitable[None] | None] | None = None
 
 
 @dataclass(slots=True)
@@ -412,8 +417,99 @@ async def check_bilibili_account(account_name: str) -> bool:
     return result.returncode == 0
 
 
-async def login_tencent_account(account_name: str, headless: bool = True) -> dict:
+def convert_tencent_cookie_header_to_storage_state(cookie_header: str) -> dict:
+    """Convert raw wxuin/sessionid fields into Tencent Playwright storage state."""
+    raw = cookie_header.strip()
+    if raw[:7].lower() == "cookie:":
+        raw = raw[7:].strip()
+    if not raw or "\r" in raw or "\n" in raw:
+        raise ValueError("视频号 Cookie 为空或包含非法换行")
+
+    required_names = ("sessionid", "wxuin")
+    values: dict[str, str] = {}
+    for segment in raw.split(";"):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if "=" not in segment:
+            raise ValueError("视频号 Cookie 必须使用 name=value 格式")
+        name, value = segment.split("=", 1)
+        name = name.strip()
+        if name in required_names:
+            value = value.strip()
+            if not value:
+                raise ValueError(f"视频号 Cookie 字段 {name} 不能为空")
+            values[name] = value
+
+    missing = [name for name in required_names if name not in values]
+    if missing:
+        raise ValueError(f"视频号 Cookie 缺少字段: {', '.join(missing)}")
+
+    return {
+        "cookies": [
+            {
+                "name": name,
+                "value": values[name],
+                "domain": "channels.weixin.qq.com",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            }
+            for name in required_names
+        ],
+        "origins": [],
+    }
+
+
+async def _import_tencent_cookie(account_file: Path, cookie_header: str) -> dict:
+    try:
+        storage_state = convert_tencent_cookie_header_to_storage_state(cookie_header)
+    except ValueError as exc:
+        return _build_login_result(False, "cookie_invalid", str(exc), account_file)
+
+    temporary_path = account_file.with_name(f".{account_file.name}.{uuid4().hex}.importing")
+    try:
+        temporary_path.write_text(
+            json.dumps(storage_state, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary_path.chmod(0o600)
+        if not await tencent_cookie_auth(str(temporary_path)):
+            return _build_login_result(
+                False,
+                "cookie_invalid",
+                "导入的视频号 Cookie 校验失败，请确认 wxuin 和 sessionid 有效",
+                account_file,
+            )
+        temporary_path.replace(account_file)
+        account_file.chmod(0o600)
+        return _build_login_result(
+            True,
+            "cookie_valid",
+            "视频号 Cookie 导入成功并通过校验",
+            account_file,
+        )
+    except OSError as exc:
+        return _build_login_result(
+            False,
+            "failed",
+            f"无法保存视频号 Cookie: {account_file}（{exc}）",
+            account_file,
+        )
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+async def login_tencent_account(
+    account_name: str,
+    headless: bool = True,
+    cookie_import: str | None = None,
+) -> dict:
     account_file = resolve_account_file("tencent", account_name)
+    if cookie_import is not None:
+        return await _import_tencent_cookie(account_file, cookie_import)
     return await tencent_setup(str(account_file), handle=True, return_detail=True, headless=headless)
 
 
@@ -650,8 +746,9 @@ async def upload_bilibili_video(request: BilibiliVideoUploadRequest) -> Path:
 
 
 async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
-    account_file = resolve_account_file("tencent", request.account_name)
-    is_ready = await tencent_setup(str(account_file), handle=False)
+    account_file = request.account_file or resolve_account_file("tencent", request.account_name)
+    account_file = Path(account_file)
+    is_ready = await tencent_setup(str(account_file), handle=False, headless=request.headless)
     if not is_ready:
         raise RuntimeError(
             f"Tencent/WeChat Channels cookie is missing or expired: {account_file}. "
@@ -678,6 +775,8 @@ async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        publish_timeout_seconds=request.publish_timeout_seconds,
+        progress_callback=request.progress_callback,
     )
     await app.tencent_upload_video()
     return account_file
@@ -697,6 +796,23 @@ def schedule_value(value: str):
         raise argparse.ArgumentTypeError(
             f"Invalid schedule '{value}'. Expected format: {SCHEDULE_FORMAT}"
         ) from exc
+
+
+def positive_seconds_value(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Timeout must be a number of seconds") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("Timeout must be greater than zero")
+    return seconds
+
+
+def tencent_short_title_value(value: str) -> str:
+    try:
+        return normalize_tencent_short_title(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def add_runtime_flags(parser: argparse.ArgumentParser) -> None:
@@ -838,6 +954,12 @@ def build_parser() -> argparse.ArgumentParser:
         action_parser = tencent_actions.add_parser(action_name, help=f"Tencent/WeChat Channels {action_name}")
         action_parser.add_argument("--account", required=True, help="Tencent user-defined account_name")
         if action_name == "login":
+            action_parser.add_argument(
+                "--cookie_import",
+                "--cookie-import",
+                dest="cookie_import",
+                help="Raw wxuin/sessionid Cookie fields; quote the entire value",
+            )
             add_runtime_flags(action_parser)
 
     tencent_upload_video_parser = tencent_actions.add_parser("upload-video", help="Upload one video to WeChat Channels")
@@ -850,9 +972,19 @@ def build_parser() -> argparse.ArgumentParser:
     tencent_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional 3:4 portrait thumbnail path")
     tencent_upload_video_parser.add_argument("--thumbnail-landscape", type=existing_file_path, help="Optional 4:3 landscape thumbnail path")
     tencent_upload_video_parser.add_argument("--thumbnail-portrait", type=existing_file_path, help="Optional 3:4 portrait thumbnail path")
-    tencent_upload_video_parser.add_argument("--short-title", help="Optional WeChat Channels short title")
+    tencent_upload_video_parser.add_argument(
+        "--short-title",
+        type=tencent_short_title_value,
+        help="Optional WeChat Channels short title (6-16 characters)",
+    )
     tencent_upload_video_parser.add_argument("--category", help="Optional original content category")
     tencent_upload_video_parser.add_argument("--draft", action="store_true", help="Save as draft instead of publishing")
+    tencent_upload_video_parser.add_argument(
+        "--publish-timeout-seconds",
+        type=positive_seconds_value,
+        default=120,
+        help="Maximum seconds to wait for publish confirmation after clicking once (default: 120)",
+    )
     add_runtime_flags(tencent_upload_video_parser)
 
     youtube_parser = platform_parsers.add_parser("youtube", help="YouTube operations")
@@ -1094,7 +1226,11 @@ async def dispatch(args: argparse.Namespace) -> int:
 
     if args.platform == "tencent":
         if args.action == "login":
-            result = await login_tencent_account(args.account, headless=args.headless)
+            result = await login_tencent_account(
+                args.account,
+                headless=args.headless,
+                cookie_import=getattr(args, "cookie_import", None),
+            )
             if not result["success"]:
                 raise RuntimeError(result["message"])
             print(f"Tencent/WeChat Channels login flow completed: {result['account_file']}")
@@ -1124,6 +1260,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                publish_timeout_seconds=getattr(args, "publish_timeout_seconds", 120),
             )
             await upload_tencent_video(request)
             print(f"Tencent/WeChat Channels video upload submitted: {request.video_file}")

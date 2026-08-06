@@ -99,16 +99,20 @@ def format_str_for_short_title(origin_title: str) -> str:
 
     if len(formatted_string) > 16:
         formatted_string = formatted_string[:16]
-    elif len(formatted_string) < 6:
-        formatted_string += " " * (6 - len(formatted_string))
-
-    return formatted_string
+    return formatted_string if len(formatted_string) >= 6 else ""
 
 
-async def cookie_auth(account_file):
+def normalize_tencent_short_title(value: str) -> str:
+    normalized = value.strip()
+    if not 6 <= len(normalized) <= 16:
+        raise ValueError("视频号短标题长度必须为 6-16 个字符")
+    return normalized
+
+
+async def cookie_auth(account_file, headless: bool = True):
     account_file = _resolve_account_file(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
+        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=headless))
         try:
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
@@ -451,7 +455,7 @@ async def tencent_setup(
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     account_file = _resolve_account_file(account_file)
-    if not os.path.exists(account_file) or not await cookie_auth(account_file):
+    if not os.path.exists(account_file) or not await cookie_auth(account_file, headless=headless):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
             return result if return_detail else False
@@ -492,6 +496,10 @@ class TencentBaseUploader(BaseVideoUploader):
         publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        publish_timeout_seconds: float = 120,
+        upload_timeout_seconds: float = 1800,
+        upload_entry_timeout_seconds: float = 60,
+        progress_callback=None,
     ):
         self.publish_date = publish_date
         self.account_file = _resolve_account_file(account_file)
@@ -499,11 +507,22 @@ class TencentBaseUploader(BaseVideoUploader):
         self.debug = debug
         self.headless = headless
         self.local_executable_path = LOCAL_CHROME_PATH
+        self.publish_timeout_seconds = publish_timeout_seconds
+        self.upload_timeout_seconds = upload_timeout_seconds
+        self.upload_entry_timeout_seconds = upload_entry_timeout_seconds
+        self.progress_callback = progress_callback
+
+    async def emit_progress(self, stage: str, message: str) -> None:
+        if not self.progress_callback:
+            return
+        result = self.progress_callback(stage, message)
+        if inspect.isawaitable(result):
+            await result
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
             raise RuntimeError(f"cookie文件不存在，请先完成视频号登录: {self.account_file}")
-        if not await cookie_auth(self.account_file):
+        if not await cookie_auth(self.account_file, headless=self.headless):
             raise RuntimeError(f"cookie文件已失效，请先完成视频号登录: {self.account_file}")
         if self.publish_strategy not in {TENCENT_PUBLISH_STRATEGY_IMMEDIATE, TENCENT_PUBLISH_STRATEGY_SCHEDULED}:
             raise ValueError(f"不支持的发布策略: {self.publish_strategy}")
@@ -567,21 +586,83 @@ class TencentBaseUploader(BaseVideoUploader):
                     continue
             return None
 
-        fi = await find_file_input()
-        if fi is None:
-            # 助手落在首页：先点「发表视频」唤出编辑器与上传控件
-            publish_btn = page.get_by_text("发表视频").first
-            if await publish_btn.count():
-                await publish_btn.click()
-                await asyncio.sleep(3)
-            for _ in range(20):
-                fi = await find_file_input()
-                if fi is not None:
-                    break
-                await asyncio.sleep(1)
-        if fi is None:
-            raise RuntimeError("未找到视频号文件上传框")
-        await fi.set_input_files(file_path)
+        deadline = asyncio.get_running_loop().time() + self.upload_entry_timeout_seconds
+        next_entry_click_at = 0.0
+        entry_labels = ("发表视频", "发表动态", "发布视频", "发布动态")
+
+        while asyncio.get_running_loop().time() < deadline:
+            fi = await find_file_input()
+            if fi is not None:
+                try:
+                    await fi.set_input_files(file_path)
+                    return
+                except Exception as exc:
+                    # 页面切换时旧 iframe 可能正好被销毁，重新扫描当前 frames。
+                    tencent_logger.debug(_msg("🔎", f"上传框已失效，重新查找: {exc}"))
+
+            current_url = page.url
+            if "login.html" in current_url or any(
+                "open.weixin.qq.com/connect/qrconnect" in fr.url for fr in page.frames
+            ):
+                raise RuntimeError(
+                    "视频号 cookie 已失效（被跳转到登录页），请重新扫码登录后再发布"
+                )
+
+            now = asyncio.get_running_loop().time()
+            if now >= next_entry_click_at:
+                clicked_entry = False
+                # 创作者首页的入口可能延迟数秒才渲染；每轮都重新查询，且兼容 iframe。
+                scopes = [page, *page.frames]
+                for scope in scopes:
+                    get_by_text = getattr(scope, "get_by_text", None)
+                    if get_by_text is None:
+                        continue
+                    for label in entry_labels:
+                        try:
+                            entries = get_by_text(label, exact=True)
+                            for index in range(await entries.count()):
+                                entry = entries.nth(index)
+                                if await entry.is_visible():
+                                    await entry.click(timeout=5000)
+                                    tencent_logger.info(
+                                        _msg("🏃", f"已点击视频号「{label}」入口，等待上传框")
+                                    )
+                                    clicked_entry = True
+                                    next_entry_click_at = now + 3
+                                    break
+                        except Exception:
+                            continue
+                        if clicked_entry:
+                            break
+                    if clicked_entry:
+                        break
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                await asyncio.sleep(min(0.5, remaining))
+
+        diagnostic_path = Path(BASE_DIR) / "debug_tencent_upload_entry_failure.png"
+        screenshot: str | None = None
+        try:
+            await page.screenshot(path=str(diagnostic_path), full_page=True)
+            screenshot = str(diagnostic_path)
+        except Exception:
+            pass
+        try:
+            frame_urls = [fr.url for fr in page.frames]
+        except Exception:
+            frame_urls = []
+        try:
+            visible_text = (await page.locator("body").first.inner_text()).strip()[-2000:]
+        except Exception:
+            visible_text = ""
+        details = (
+            f"url={page.url}; frames={frame_urls}; "
+            f"screenshot={screenshot or '<unavailable>'}"
+        )
+        if visible_text:
+            details += f"; visible_text={visible_text}"
+        raise RuntimeError(f"未找到视频号文件上传框；{details}")
 
     async def set_short_title(self, page: Page, title: str, short_title: str | None = None) -> None:
         short_title_element = (
@@ -590,8 +671,9 @@ class TencentBaseUploader(BaseVideoUploader):
             .locator("xpath=following-sibling::div")
             .locator('span input[type="text"]')
         )
-        if await short_title_element.count():
-            await short_title_element.fill(short_title or format_str_for_short_title(title))
+        value = short_title if short_title is not None else format_str_for_short_title(title)
+        if value and await short_title_element.count():
+            await short_title_element.fill(value)
 
     async def fill_title_and_tags(self, page: Page) -> None:
         await page.locator("div.input-editor").click()
@@ -717,55 +799,304 @@ class TencentBaseUploader(BaseVideoUploader):
             tencent_logger.warning(_msg("📭", "本视频未声明原创（页面无入口或为可选项），跳过并继续发布"))
 
     async def wait_for_upload_complete(self, page: Page) -> None:
-        while True:
+        deadline = asyncio.get_running_loop().time() + self.upload_timeout_seconds
+        ready_observations = 0
+
+        async def upload_is_pending() -> bool:
+            selectors = (
+                '.upload-progress:visible, '
+                '.post-media-preview-wrap .ant-progress:visible, '
+                '.media-status-content:has-text("取消上传"):visible, '
+                '[class*="uploading"]:visible'
+            )
+            scopes = [page, *getattr(page, "frames", [])]
+            for scope in scopes:
+                try:
+                    if await scope.locator(selectors).count():
+                        return True
+                except Exception:
+                    pass
+                get_by_text = getattr(scope, "get_by_text", None)
+                if get_by_text is None:
+                    continue
+                for text in (
+                    "取消上传",
+                    "上传中",
+                    "正在上传",
+                    "处理中",
+                    "正在处理",
+                    "转码中",
+                ):
+                    try:
+                        markers = get_by_text(text, exact=True)
+                        for index in range(min(await markers.count(), 5)):
+                            if await markers.nth(index).is_visible():
+                                return True
+                    except Exception:
+                        continue
+            return False
+
+        while asyncio.get_running_loop().time() < deadline:
             try:
-                publish_button = page.get_by_role("button", name="发表")
-                button_class = await publish_button.get_attribute("class")
-                if button_class and "weui-desktop-btn_disabled" not in button_class:
-                    tencent_logger.info(_msg("🥳", "视频上传完毕"))
-                    break
+                publish_button = await self._find_action_button(page, "发表")
+                button_class = (
+                    await publish_button.get_attribute("class")
+                    if publish_button is not None
+                    else None
+                )
+                button_is_ready = bool(
+                    button_class and "disabled" not in button_class.lower()
+                )
+                pending = await upload_is_pending()
+                if button_is_ready and not pending:
+                    # 连续两次观测均就绪，避免新版页面在上传初始化时短暂启用按钮。
+                    ready_observations += 1
+                    if ready_observations >= 2:
+                        tencent_logger.info(_msg("🥳", "视频上传完毕"))
+                        return
+                else:
+                    ready_observations = 0
 
                 tencent_logger.info(_msg("🏃", "正在上传视频中..."))
-                await asyncio.sleep(2)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    await asyncio.sleep(min(1, remaining))
 
                 upload_failed = await page.locator("div.status-msg.error").count()
                 delete_button = await page.locator('div.media-status-content div.tag-inner:has-text("删除")').count()
                 if upload_failed and delete_button:
                     tencent_logger.error(_msg("😵", "发现上传出错了，准备重试"))
                     await self.handle_upload_error(page)
-            except Exception:
+            except Exception as exc:
+                tencent_logger.debug(_msg("🔎", f"检查视频上传状态失败，继续等待: {exc}"))
+                ready_observations = 0
                 tencent_logger.info(_msg("🏃", "正在上传视频中..."))
-                await asyncio.sleep(2)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    await asyncio.sleep(min(1, remaining))
+
+        diagnostic_path = Path(BASE_DIR) / "debug_tencent_upload_timeout.png"
+        try:
+            await page.screenshot(path=str(diagnostic_path), full_page=True)
+        except Exception:
+            diagnostic_path = None
+        suffix = f"，诊断截图: {diagnostic_path}" if diagnostic_path else ""
+        raise TimeoutError(
+            f"等待视频上传完成超时（{self.upload_timeout_seconds:g} 秒）{suffix}"
+        )
+
+    @staticmethod
+    async def _visible_text(page: Page, selector: str) -> str | None:
+        for scope in [page, *getattr(page, "frames", [])]:
+            try:
+                locator = scope.locator(selector)
+                for index in range(min(await locator.count(), 10)):
+                    item = locator.nth(index)
+                    if await item.is_visible():
+                        text = (await item.inner_text()).strip()
+                        if text:
+                            return text
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    async def _visible_success_text(page: Page, texts: tuple[str, ...]) -> str | None:
+        for scope in [page, *getattr(page, "frames", [])]:
+            get_by_text = getattr(scope, "get_by_text", None)
+            if get_by_text is None:
+                continue
+            for text in texts:
+                try:
+                    locator = get_by_text(text, exact=False).first
+                    if await locator.count() and await locator.is_visible():
+                        return text
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    async def _find_action_button(page: Page, action_name: str):
+        for scope in [page, *getattr(page, "frames", [])]:
+            get_by_role = getattr(scope, "get_by_role", None)
+            if get_by_role is not None:
+                try:
+                    button = get_by_role("button", name=action_name)
+                    if await button.count():
+                        return button.first
+                except Exception:
+                    pass
+            try:
+                button = scope.locator(
+                    f'div.form-btns button:has-text("{action_name}")'
+                )
+                if await button.count():
+                    return button.first
+            except Exception:
+                continue
+        return None
+
+    async def _publish_diagnostics(self, page: Page, button, reason: str) -> str:
+        diagnostic_path = Path(BASE_DIR) / "debug_tencent_publish_failure.png"
+        screenshot: str | None = None
+        try:
+            await page.screenshot(path=str(diagnostic_path), full_page=True)
+            screenshot = str(diagnostic_path)
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"保存发布失败诊断截图失败: {exc}"))
+
+        try:
+            button_class = await button.get_attribute("class")
+        except Exception:
+            button_class = None
+        visible_parts = []
+        for scope in [page, *getattr(page, "frames", [])]:
+            try:
+                text = (await scope.locator("body").first.inner_text()).strip()
+                if text:
+                    visible_parts.append(text[-2000:])
+            except Exception:
+                continue
+        visible_text = "\n--- frame ---\n".join(visible_parts)[-6000:]
+
+        details = (
+            f"reason={reason}; url={page.url}; button_class={button_class or '<none>'}; "
+            f"screenshot={screenshot or '<unavailable>'}"
+        )
+        if visible_text:
+            details += f"; visible_text={visible_text}"
+        tencent_logger.error(_msg("😵", f"视频号发布未确认: {details}"))
+        return details
 
     async def submit_publish(self, page: Page) -> None:
-        while True:
+        is_draft = bool(getattr(self, "is_draft", False))
+        action_name = "保存草稿" if is_draft else "发表"
+        success_name = "视频草稿保存成功" if is_draft else "视频发布成功"
+        timeout_name = "视频草稿保存确认超时" if is_draft else "视频发布确认超时"
+        error_selector = (
+            '[role="alert"]:visible, '
+            '.ant-message-error:visible, '
+            '.weui-desktop-toast_error:visible, '
+            '.weui-desktop-form__error:visible, '
+            '.ant-form-item-explain-error:visible, '
+            '.form-item-error:visible, '
+            '.form-error:visible, '
+            '.error-msg:visible, '
+            '[class*="error-message"]:visible'
+        )
+        known_validation_texts = (
+            "短标题至少6个字",
+            "短标题至少 6 个字",
+            "短标题长度必须为6-16个字",
+            "短标题长度必须为 6-16 个字",
+        )
+        button = await self._find_action_button(page, action_name)
+        if button is None:
+            details = await self._publish_diagnostics(page, button, f"未找到{action_name}按钮")
+            raise RuntimeError(f"未找到视频号{action_name}按钮；{details}")
+
+        button_class = await button.get_attribute("class")
+        if button_class and "disabled" in button_class:
+            details = await self._publish_diagnostics(page, button, f"{action_name}按钮不可用")
+            raise RuntimeError(f"视频号{action_name}按钮不可用；{details}")
+
+        form_error = await self._visible_text(page, error_selector)
+        known_validation = await self._visible_success_text(
+            page, known_validation_texts
+        )
+        if form_error or known_validation:
+            message = form_error or known_validation or "表单参数不符合平台要求"
+            details = await self._publish_diagnostics(
+                page, button, f"表单校验失败: {message}"
+            )
+            raise RuntimeError(f"视频号表单校验失败: {message}；{details}")
+
+        click_timeout_ms = max(1000, min(10000, int(self.publish_timeout_seconds * 1000)))
+        upload_rejection_texts = (
+            "文件上传中",
+            "视频上传中",
+            "请等待完成后再发表",
+        )
+        for attempt in range(2):
             try:
-                if getattr(self, "is_draft", False):
-                    draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
-                    if await draft_button.count():
-                        await draft_button.click()
-                    await page.wait_for_url("**/post/list**", timeout=5000)
-                    tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
-                else:
-                    publish_button = page.locator('div.form-btns button:has-text("发表")')
-                    if await publish_button.count():
-                        await publish_button.click()
-                    await page.wait_for_url(TENCENT_MANAGE_URL, timeout=5000)
-                    tencent_logger.success(_msg("🥳", "视频发布成功"))
-                break
+                # 仅当平台明确说明文件仍在上传时才允许第二次点击；真正提交后绝不重试。
+                await button.click(timeout=click_timeout_ms)
             except Exception as exc:
-                current_url = page.url
-                if getattr(self, "is_draft", False):
-                    if "post/list" in current_url or "draft" in current_url:
-                        tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
-                        break
-                else:
-                    if TENCENT_MANAGE_URL in current_url:
-                        tencent_logger.success(_msg("🥳", "视频发布成功"))
-                        break
-                tencent_logger.exception(f"  [-] Exception: {exc}")
-                tencent_logger.info(_msg("🏃", "视频正在发布中..."))
-                await asyncio.sleep(0.5)
+                details = await self._publish_diagnostics(
+                    page, button, f"点击{action_name}失败: {exc}"
+                )
+                raise RuntimeError(f"点击视频号{action_name}按钮失败；{details}") from exc
+
+            await asyncio.sleep(min(0.25, max(0.01, self.publish_timeout_seconds / 4)))
+            upload_rejection = await self._visible_success_text(
+                page, upload_rejection_texts
+            )
+            if not upload_rejection:
+                break
+            if attempt:
+                details = await self._publish_diagnostics(
+                    page, button, f"平台仍提示{upload_rejection}"
+                )
+                raise RuntimeError(f"视频号文件仍未上传完成；{details}")
+
+            tencent_logger.warning(
+                _msg("⏳", "平台提示文件仍在上传，等待真正完成后再发表")
+            )
+            await self.wait_for_upload_complete(page)
+            button = await self._find_action_button(page, action_name)
+            if button is None:
+                details = await self._publish_diagnostics(
+                    page, button, f"等待上传完成后未找到{action_name}按钮"
+                )
+                raise RuntimeError(f"未找到视频号{action_name}按钮；{details}")
+
+        if not is_draft:
+            await self.emit_progress("publishing", "已点击发表，正在等待视频号确认结果")
+
+        deadline = asyncio.get_running_loop().time() + self.publish_timeout_seconds
+        success_texts = (
+            ("草稿保存成功", "保存草稿成功")
+            if is_draft
+            else ("发表成功", "发布成功")
+        )
+        last_log_at = 0.0
+
+        while True:
+            current_url = page.url
+            success_url = (
+                "post/list" in current_url or "draft" in current_url
+                if is_draft
+                else "/platform/post/list" in current_url
+            )
+            success_text = await self._visible_success_text(page, success_texts)
+            if success_url or success_text:
+                tencent_logger.success(_msg("🥳", success_name))
+                return
+
+            known_validation = await self._visible_success_text(
+                page, known_validation_texts
+            )
+            platform_error = await self._visible_text(page, error_selector)
+            if platform_error or known_validation:
+                message = platform_error or known_validation or "表单参数不符合平台要求"
+                details = await self._publish_diagnostics(
+                    page, button, f"平台返回错误: {message}"
+                )
+                raise RuntimeError(f"视频号{action_name}失败: {message}；{details}")
+
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                details = await self._publish_diagnostics(
+                    page, button, f"{timeout_name}，平台端结果未知"
+                )
+                raise TimeoutError(
+                    f"{timeout_name}（{self.publish_timeout_seconds:g} 秒），"
+                    f"{action_name}按钮只点击了一次，平台端结果未知；{details}"
+                )
+            if now - last_log_at >= 5:
+                tencent_logger.info(_msg("🏃", f"视频正在{action_name}中..."))
+                last_log_at = now
+            await asyncio.sleep(min(0.5, deadline - now))
 
 
 class TencentVideo(TencentBaseUploader):
@@ -786,6 +1117,8 @@ class TencentVideo(TencentBaseUploader):
         publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        publish_timeout_seconds: float = 120,
+        progress_callback=None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -793,6 +1126,8 @@ class TencentVideo(TencentBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            publish_timeout_seconds=publish_timeout_seconds,
+            progress_callback=progress_callback,
         )
         self.title = title
         self.file_path = file_path
@@ -806,9 +1141,11 @@ class TencentVideo(TencentBaseUploader):
         self.short_title = short_title
 
     async def validate_upload_args(self):
-        await self.validate_base_args()
         if not self.title or not str(self.title).strip():
             raise ValueError("视频模式下，title 是必须的")
+        if self.short_title is not None:
+            self.short_title = normalize_tencent_short_title(self.short_title)
+        await self.validate_base_args()
         self.file_path = str(self.validate_video_file(self.file_path))
         if self.thumbnail_landscape_path:
             self.thumbnail_landscape_path = str(self.validate_image_file(self.thumbnail_landscape_path))
@@ -943,7 +1280,9 @@ class TencentVideo(TencentBaseUploader):
             await self.open_upload_page(page)
             tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
 
+            await self.emit_progress("uploading_material", "正在上传视频号视频素材")
             await self.upload_video_file(page, self.file_path)
+            await self.emit_progress("filling_metadata", "正在填写视频号发布信息")
             await self.prepare_video_for_publish(page)
             await self.wait_for_upload_complete(page)
             await self.apply_original_statement(page)

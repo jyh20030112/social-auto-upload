@@ -24,6 +24,7 @@ sau = "sau_cli:main"
 api = [
   "aiosqlite>=0.21.0",
   "fastapi>=0.116.0",
+  "httpx>=0.28.1",
   "python-multipart>=0.0.20",
   "sqlalchemy>=2.0.41",
   "uvicorn[standard]>=0.35.0",

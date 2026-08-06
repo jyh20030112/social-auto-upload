@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -107,4 +107,27 @@ class TaskMaterialRecord(Base):
     )
     material_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("materials.id", ondelete="RESTRICT"), primary_key=True
+    )
+
+
+class CallbackDeliveryRecord(Base):
+    __tablename__ = "callback_deliveries"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("tasks.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    callback_url: Mapped[str] = mapped_column(Text, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True, nullable=False
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )

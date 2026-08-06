@@ -15,6 +15,7 @@ class TaskStatus(StrEnum):
 
 class TaskOperation(StrEnum):
     LOGIN = "login"
+    UPLOAD_MATERIALS = "upload_materials"
     PUBLISH_VIDEO = "publish_video"
     PUBLISH_NOTE = "publish_note"
 
@@ -24,6 +25,7 @@ class TaskStage(StrEnum):
     VALIDATING_ACCOUNT = "validating_account"
     LAUNCHING_BROWSER = "launching_browser"
     UPLOADING_MATERIAL = "uploading_material"
+    PROCESSING_MATERIALS = "processing_materials"
     FILLING_METADATA = "filling_metadata"
     WAITING_VERIFICATION = "waiting_verification"
     PUBLISHING = "publishing"

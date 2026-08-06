@@ -8,7 +8,6 @@ from app.src.api.dependencies import get_container
 from app.src.container import AppContainer
 from app.src.schemas.responses import ApiSuccessEnvelope, success_response
 
-
 router = APIRouter(prefix="/health", tags=["douyin"])
 
 
@@ -38,7 +37,11 @@ async def ready(
     container: Annotated[AppContainer, Depends(get_container)],
 ):
     database_ready = await container.database.ping()
-    worker_ready = not container.settings.worker_enabled or container.worker.healthy
+    worker_ready = not container.settings.worker_enabled or (
+        container.worker.healthy
+        and container.material_worker.healthy
+        and container.callback_worker.healthy
+    )
     ready_state = database_ready and worker_ready
     return success_response(
         {

@@ -730,6 +730,7 @@ dependencies = [
 api = [
     { name = "aiosqlite" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "python-multipart" },
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
@@ -748,6 +749,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.116.0" },
     { name = "flask", extras = ["async"], marker = "extra == 'web'", specifier = "==3.1.1" },
     { name = "flask-cors", marker = "extra == 'web'", specifier = "==6.0.0" },
+    { name = "httpx", marker = "extra == 'api'", specifier = ">=0.28.1" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.28.1" },
     { name = "loguru", specifier = "==0.7.3" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },

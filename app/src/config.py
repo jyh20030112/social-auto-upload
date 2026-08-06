@@ -20,11 +20,15 @@ class Settings:
     data_dir: Path
     database_url: str
     max_browser_tasks: int = 2
+    max_material_tasks: int = 2
+    max_callback_tasks: int = 4
     video_max_bytes: int = 2 * 1024 * 1024 * 1024
     image_max_bytes: int = 20 * 1024 * 1024
     login_timeout_seconds: int = 180
     video_timeout_seconds: int = 1800
     note_timeout_seconds: int = 900
+    material_timeout_seconds: int = 1800
+    callback_timeout_seconds: int = 10
     verification_timeout_seconds: int = 300
     check_timeout_seconds: int = 90
     shutdown_grace_seconds: int = 30
@@ -49,8 +53,12 @@ class Settings:
     def trash_dir(self) -> Path:
         return self.temporary_dir / "trash"
 
+    @property
+    def task_staging_dir(self) -> Path:
+        return self.temporary_dir / "tasks"
+
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         default_data_dir = Path(__file__).resolve().parents[1] / "data"
         data_dir = Path(os.getenv("SAU_API_DATA_DIR", default_data_dir)).expanduser().resolve()
         database_url = os.getenv("SAU_API_DATABASE_URL", f"sqlite+aiosqlite:///{data_dir / 'app.db'}")
@@ -58,11 +66,15 @@ class Settings:
             data_dir=data_dir,
             database_url=database_url,
             max_browser_tasks=_positive_int("SAU_API_MAX_BROWSER_TASKS", 2),
+            max_material_tasks=_positive_int("SAU_API_MAX_MATERIAL_TASKS", 2),
+            max_callback_tasks=_positive_int("SAU_API_MAX_CALLBACK_TASKS", 4),
             video_max_bytes=_positive_int("SAU_API_VIDEO_MAX_BYTES", 2 * 1024 * 1024 * 1024),
             image_max_bytes=_positive_int("SAU_API_IMAGE_MAX_BYTES", 20 * 1024 * 1024),
             login_timeout_seconds=_positive_int("SAU_API_LOGIN_TIMEOUT_SECONDS", 180),
             video_timeout_seconds=_positive_int("SAU_API_VIDEO_TIMEOUT_SECONDS", 1800),
             note_timeout_seconds=_positive_int("SAU_API_NOTE_TIMEOUT_SECONDS", 900),
+            material_timeout_seconds=_positive_int("SAU_API_MATERIAL_TIMEOUT_SECONDS", 1800),
+            callback_timeout_seconds=_positive_int("SAU_API_CALLBACK_TIMEOUT_SECONDS", 10),
             verification_timeout_seconds=_positive_int("SAU_API_VERIFICATION_TIMEOUT_SECONDS", 300),
             check_timeout_seconds=_positive_int("SAU_API_CHECK_TIMEOUT_SECONDS", 90),
             shutdown_grace_seconds=_positive_int("SAU_API_SHUTDOWN_GRACE_SECONDS", 30),
@@ -72,9 +84,16 @@ class Settings:
             headless=os.getenv("SAU_API_HEADLESS", "true").lower() not in {"0", "false", "no"},
         )
 
-    def with_overrides(self, **changes) -> "Settings":
+    def with_overrides(self, **changes) -> Settings:
         return replace(self, **changes)
 
     def ensure_directories(self) -> None:
-        for path in (self.data_dir, self.cookies_dir, self.materials_dir, self.temporary_dir, self.trash_dir):
+        for path in (
+            self.data_dir,
+            self.cookies_dir,
+            self.materials_dir,
+            self.temporary_dir,
+            self.trash_dir,
+            self.task_staging_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)

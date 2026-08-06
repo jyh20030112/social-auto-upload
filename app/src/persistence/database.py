@@ -26,8 +26,10 @@ class Database:
         async with self.session_factory() as session:
             version = await session.get(SchemaVersionRecord, 1)
             if version is None:
-                session.add(SchemaVersionRecord(id=1, version=1))
-                await session.commit()
+                session.add(SchemaVersionRecord(id=1, version=2))
+            elif version.version < 2:
+                version.version = 2
+            await session.commit()
 
     async def ping(self) -> bool:
         try:

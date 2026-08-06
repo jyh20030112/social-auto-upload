@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import UploadFile
+from starlette.datastructures import Headers
 
 from app.src.config import Settings
 from app.src.domain.errors import ApiError
+from app.src.domain.states import TaskOperation
 from app.src.persistence.repositories import Repository
 from app.src.persistence.tables import MaterialRecord
 from uploader.base_video import BaseVideoUploader
@@ -26,6 +29,18 @@ class MaterialService:
     def __init__(self, settings: Settings, repository: Repository) -> None:
         self.settings = settings
         self.repository = repository
+
+    def _classify(self, original_name: str) -> tuple[str, str, int]:
+        extension = Path(original_name).suffix.lower()
+        if extension in self.VIDEO_EXTENSIONS:
+            return extension, "video", self.settings.video_max_bytes
+        if extension in self.IMAGE_EXTENSIONS:
+            return extension, "image", self.settings.image_max_bytes
+        raise ApiError(
+            422,
+            "UNSUPPORTED_MATERIAL_TYPE",
+            f"不支持的素材扩展名: {extension or '<none>'}",
+        )
 
     @staticmethod
     def _copy_and_hash(source, destination: Path, limit: int) -> tuple[int, str]:
@@ -45,19 +60,7 @@ class MaterialService:
 
     async def save_one(self, account: str, upload: UploadFile) -> dict:
         original_name = Path(upload.filename or "").name
-        extension = Path(original_name).suffix.lower()
-        if extension in self.VIDEO_EXTENSIONS:
-            kind = "video"
-            size_limit = self.settings.video_max_bytes
-        elif extension in self.IMAGE_EXTENSIONS:
-            kind = "image"
-            size_limit = self.settings.image_max_bytes
-        else:
-            raise ApiError(
-                422,
-                "UNSUPPORTED_MATERIAL_TYPE",
-                f"不支持的素材扩展名: {extension or '<none>'}",
-            )
+        extension, kind, size_limit = self._classify(original_name)
 
         temporary_path = self.settings.temporary_dir / f"{uuid4().hex}.upload"
         try:
@@ -125,6 +128,148 @@ class MaterialService:
             "succeeded_count": succeeded,
             "failed_count": len(items) - succeeded,
         }
+
+    async def stage_many(
+        self,
+        account: str,
+        uploads: list[UploadFile],
+        callback_url: str,
+    ):
+        if not uploads:
+            raise ApiError(422, "MATERIALS_REQUIRED", "至少上传一个素材")
+        if len(uploads) > 35:
+            raise ApiError(422, "TOO_MANY_MATERIALS", "单次最多上传 35 个素材")
+
+        task_id = uuid4().hex
+        task_dir = self.settings.task_staging_dir / task_id
+        task_dir.mkdir(parents=True, exist_ok=False)
+        staged_items: list[dict] = []
+        try:
+            for index, upload in enumerate(uploads):
+                original_name = Path(upload.filename or "").name
+                try:
+                    extension, kind, size_limit = self._classify(original_name)
+                    staged_path = task_dir / f"{index:02d}-{uuid4().hex}{extension}"
+                    await upload.seek(0)
+                    size, _ = await asyncio.to_thread(
+                        self._copy_and_hash,
+                        upload.file,
+                        staged_path,
+                        size_limit,
+                    )
+                    staged_items.append(
+                        {
+                            "filename": original_name,
+                            "content_type": upload.content_type,
+                            "kind": kind,
+                            "size_bytes": size,
+                            "staged_path": str(staged_path),
+                        }
+                    )
+                except MaterialTooLargeError as exc:
+                    staged_items.append(
+                        {
+                            "filename": original_name,
+                            "error": {
+                                "code": "MATERIAL_TOO_LARGE",
+                                "message": str(exc),
+                                "details": {},
+                            },
+                        }
+                    )
+                except ApiError as exc:
+                    staged_items.append(
+                        {
+                            "filename": original_name,
+                            "error": {
+                                "code": exc.code,
+                                "message": exc.message,
+                                "details": exc.details,
+                            },
+                        }
+                    )
+                finally:
+                    await upload.close()
+
+            return await self.repository.create_task(
+                task_id=task_id,
+                account=account,
+                operation=TaskOperation.UPLOAD_MATERIALS.value,
+                payload={
+                    "callback_url": callback_url,
+                    "staging_dir": str(task_dir),
+                    "items": staged_items,
+                },
+            )
+        except Exception:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            raise
+
+    async def process_staged(self, account: str, payload: dict) -> dict:
+        results: list[dict] = []
+        succeeded = 0
+        try:
+            for item in payload["items"]:
+                if item.get("error"):
+                    results.append(
+                        {
+                            "success": False,
+                            "filename": item.get("filename"),
+                            "error": item["error"],
+                        }
+                    )
+                    continue
+                staged_path = Path(item["staged_path"])
+                if not staged_path.exists():
+                    results.append(
+                        {
+                            "success": False,
+                            "filename": item["filename"],
+                            "error": {
+                                "code": "STAGED_FILE_MISSING",
+                                "message": "暂存素材文件不存在",
+                                "details": {},
+                            },
+                        }
+                    )
+                    continue
+                with staged_path.open("rb") as source:
+                    upload = UploadFile(
+                        file=source,
+                        filename=item["filename"],
+                        headers=Headers({"content-type": item.get("content_type") or "application/octet-stream"}),
+                    )
+                    try:
+                        material = await self.save_one(account, upload)
+                        results.append({"success": True, "material": material})
+                        succeeded += 1
+                    except ApiError as exc:
+                        results.append(
+                            {
+                                "success": False,
+                                "filename": item["filename"],
+                                "error": {
+                                    "code": exc.code,
+                                    "message": exc.message,
+                                    "details": exc.details,
+                                },
+                            }
+                        )
+                    finally:
+                        await upload.close()
+        finally:
+            self.cleanup_staged(payload)
+        return {
+            "items": results,
+            "succeeded_count": succeeded,
+            "failed_count": len(results) - succeeded,
+        }
+
+    @staticmethod
+    def cleanup_staged(payload: dict) -> None:
+        staging_dir = payload.get("staging_dir")
+        if staging_dir:
+            shutil.rmtree(Path(staging_dir), ignore_errors=True)
 
     async def delete(self, account: str, material_id: str) -> None:
         material = await self.repository.get_material_for_account(material_id, account)

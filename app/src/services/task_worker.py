@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.src.config import Settings
 from app.src.domain.states import TaskOperation, TaskStage, TaskStatus
@@ -38,7 +38,6 @@ class TaskWorker:
 
     async def start(self) -> None:
         self._stopping = False
-        await self.repository.mark_inflight_interrupted()
         self._dispatcher = asyncio.create_task(self._dispatch_loop(), name="douyin-task-dispatcher")
         self._cleaner = asyncio.create_task(self._cleanup_loop(), name="douyin-task-cleaner")
 
@@ -53,7 +52,7 @@ class TaskWorker:
         )
 
         if self._running:
-            done, pending = await asyncio.wait(
+            _done, pending = await asyncio.wait(
                 list(self._running.values()),
                 timeout=self.settings.shutdown_grace_seconds,
             )
@@ -73,7 +72,13 @@ class TaskWorker:
                 self._remove_finished()
                 capacity = self.settings.max_browser_tasks - len(self._running)
                 if capacity > 0:
-                    queued = await self.repository.list_queued_tasks()
+                    queued = await self.repository.list_queued_tasks(
+                        operations=[
+                            TaskOperation.LOGIN.value,
+                            TaskOperation.PUBLISH_VIDEO.value,
+                            TaskOperation.PUBLISH_NOTE.value,
+                        ]
+                    )
                     for record in queued:
                         if capacity <= 0:
                             break
@@ -167,7 +172,17 @@ class TaskWorker:
 
     async def _execute(self, record: TaskRecord) -> dict:
         async def progress(stage: str, message: str) -> None:
-            await self.repository.update_task_progress(record.id, stage, message)
+            expires_at = None
+            if stage == TaskStage.WAITING_VERIFICATION.value:
+                expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=self.settings.verification_timeout_seconds
+                )
+            await self.repository.update_task_progress(
+                record.id,
+                stage,
+                message,
+                verification_expires_at=expires_at,
+            )
 
         async def verification_provider() -> str:
             return await self.verification.wait(

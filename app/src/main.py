@@ -14,20 +14,25 @@ from app.src.config import Settings
 from app.src.container import build_container
 from app.src.domain.errors import ApiError
 
-
 API_PREFIX = "/api/v1/douyin"
 logger = logging.getLogger(__name__)
 
 OPENAPI_DESCRIPTION = """
 # 抖音自动发布 API
 
-提供抖音账号 Cookie 登录、登录态检查、素材管理、视频/图文发布以及异步任务管理。
+提供抖音账号 Cookie 登录、登录态检查、素材管理、视频/图文发布以及任务管理。
 
 - 所有业务路由前缀为 `/api/v1/douyin`。
-- 登录和发布接口返回异步任务 ID，通过任务查询接口获取进度。
+- 登录、素材上传、视频和图文接口未传 `callback_url` 时同步等待并直接返回业务结果。
+- 传入 `callback_url` 时返回异步任务 ID，并向该 HTTP/HTTPS 地址回调任务事件。
+- 遇到短信验证码时返回或回调 `waiting_verification`，通过验证码接口提交后继续执行。
 - 视频和图文发布必须传入 `Idempotency-Key` 请求头。
 - 所有 ID 均是 32 位小写十六进制 UUID，不含连字符。
 - 定时发布时间必须包含时区，并且至少晚于当前时间 2 小时。
+
+回调以 HTTP POST JSON 发送，`event` 为 `waiting_verification` 或任务最终状态，
+`event_id` 在重试期间保持不变。任意 `2xx` 表示成功；失败最多投递 6 次，
+可通过任务查询接口的 `callbacks` 字段查看投递结果。
 """
 
 OPENAPI_TAGS = [
@@ -83,12 +88,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved_settings.ensure_directories()
         await container.database.initialize()
         if resolved_settings.worker_enabled:
+            interrupted = await container.repository.mark_inflight_interrupted()
+            for task in interrupted:
+                if task.operation == "upload_materials":
+                    container.materials.cleanup_staged(task.payload)
+            await container.callback_worker.start()
+            await container.material_worker.start()
             await container.worker.start()
         try:
             yield
         finally:
             if resolved_settings.worker_enabled:
                 await container.worker.stop()
+                await container.material_worker.stop()
+                await container.callback_worker.stop()
             await container.database.close()
 
     application = FastAPI(

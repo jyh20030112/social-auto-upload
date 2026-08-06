@@ -6,9 +6,17 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from app.src.api.dependencies import get_container
 from app.src.container import AppContainer
-from app.src.schemas.requests import AccountName, CancelTaskRequest, HexId, VerificationCodeRequest
-from app.src.schemas.responses import ApiErrorEnvelope, ApiSuccessEnvelope, success_response
-
+from app.src.schemas.requests import (
+    AccountName,
+    CancelTaskRequest,
+    HexId,
+    VerificationCodeRequest,
+)
+from app.src.schemas.responses import (
+    ApiErrorEnvelope,
+    ApiSuccessEnvelope,
+    success_response,
+)
 
 router = APIRouter(prefix="/tasks", tags=["douyin"])
 
@@ -17,8 +25,11 @@ router = APIRouter(prefix="/tasks", tags=["douyin"])
     "/{task_id}",
     response_model=ApiSuccessEnvelope,
     summary="查询抖音任务",
-    description="查询登录、视频发布或图文发布任务的当前状态，并返回最近的进度事件。",
-    response_description="任务状态、执行结果、错误和进度事件",
+    description=(
+        "查询登录、异步素材处理、视频或图文任务的当前状态，并返回最近的进度事件。"
+        "使用 callback_url 的任务还会返回各回调事件的投递状态和尝试次数。"
+    ),
+    response_description="任务状态、执行结果、错误、进度事件和回调投递状态",
     responses={
         404: {"model": ApiErrorEnvelope, "description": "任务不存在或不属于指定账号"},
         422: {"model": ApiErrorEnvelope, "description": "任务 ID 或账号参数无效"},

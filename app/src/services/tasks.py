@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -13,12 +15,17 @@ from app.src.domain.errors import ApiError
 from app.src.domain.states import TERMINAL_TASK_STATUSES, TaskOperation, TaskStatus
 from app.src.persistence.repositories import Repository
 from app.src.persistence.tables import TaskRecord
-from app.src.schemas.requests import LoginRequest, NotePublishRequest, VideoPublishRequest
+from app.src.schemas.requests import (
+    LoginRequest,
+    NotePublishRequest,
+    VideoPublishRequest,
+)
 from app.src.schemas.responses import iso_utc
 from app.src.services.accounts import AccountService
 from app.src.services.verification import VerificationHub
 
 if TYPE_CHECKING:
+    from app.src.services.material_worker import MaterialWorker
     from app.src.services.task_worker import TaskWorker
 
 
@@ -40,6 +47,7 @@ class TaskService:
         self.accounts = accounts
         self.verification = verification
         self.worker: TaskWorker | None = None
+        self.material_worker: MaterialWorker | None = None
 
     async def _idempotent_existing(
         self,
@@ -66,7 +74,12 @@ class TaskService:
         return existing
 
     async def submit_login(self, request: LoginRequest, idempotency_key: str | None = None) -> tuple[TaskRecord, bool]:
-        hash_payload = {"account": request.account, "cookie": request.cookie}
+        callback_url = str(request.callback_url) if request.callback_url else None
+        hash_payload = {
+            "account": request.account,
+            "cookie": request.cookie,
+            "callback_url": callback_url,
+        }
         request_hash = canonical_request_hash(hash_payload)
         existing = await self._idempotent_existing(
             request.account,
@@ -84,7 +97,10 @@ class TaskService:
                 task_id=task_id,
                 account=request.account,
                 operation=TaskOperation.LOGIN.value,
-                payload={"temporary_cookie_path": str(temporary_path)},
+                payload={
+                    "temporary_cookie_path": str(temporary_path),
+                    "callback_url": callback_url,
+                },
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
             )
@@ -254,7 +270,84 @@ class TaskService:
                 }
                 for event in events
             ]
+        if task.payload.get("callback_url"):
+            callbacks = await self.repository.list_task_callbacks(task.id)
+            data["callbacks"] = [
+                {
+                    "event_id": callback.id,
+                    "event": callback.event_type,
+                    "status": callback.status,
+                    "attempts": callback.attempts,
+                    "last_error": callback.last_error,
+                    "delivered_at": iso_utc(callback.delivered_at),
+                }
+                for callback in callbacks
+            ]
         return data
+
+    def _operation_timeout(self, operation: str) -> int:
+        if operation == TaskOperation.LOGIN.value:
+            return self.settings.login_timeout_seconds
+        if operation == TaskOperation.PUBLISH_VIDEO.value:
+            return self.settings.video_timeout_seconds
+        if operation == TaskOperation.PUBLISH_NOTE.value:
+            return self.settings.note_timeout_seconds
+        return self.settings.material_timeout_seconds
+
+    async def wait_for_result(self, task: TaskRecord) -> tuple[dict, int]:
+        """Wait until a task is observable by a synchronous API caller."""
+        if not self.settings.worker_enabled:
+            raise ApiError(503, "WORKER_DISABLED", "任务执行器未启用")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._operation_timeout(task.operation) + 5
+        current = task
+        while True:
+            status = TaskStatus(current.status)
+            if status == TaskStatus.WAITING_VERIFICATION:
+                events = await self.repository.list_task_events(current.id, limit=50)
+                waiting_event = next(
+                    (event for event in reversed(events) if event.stage == "waiting_verification"),
+                    None,
+                )
+                expires_at = (
+                    waiting_event.created_at
+                    + timedelta(seconds=self.settings.verification_timeout_seconds)
+                    if waiting_event is not None
+                    else None
+                )
+                return {
+                    "task_id": current.id,
+                    "status": current.status,
+                    "stage": current.stage,
+                    "verification_expires_at": iso_utc(expires_at),
+                }, 202
+            if status in TERMINAL_TASK_STATUSES:
+                if status == TaskStatus.SUCCEEDED:
+                    return current.result or {}, 200
+                if status == TaskStatus.CANCELLED:
+                    raise ApiError(409, current.error_code or "TASK_CANCELLED", current.error_message or "任务已取消")
+                if status == TaskStatus.INTERRUPTED:
+                    raise ApiError(
+                        409,
+                        current.error_code or "TASK_INTERRUPTED",
+                        current.error_message or "任务执行被中断，平台端结果可能未知",
+                        current.error_details or {},
+                    )
+                status_code = 504 if current.error_code == "TASK_TIMEOUT" else 500
+                raise ApiError(
+                    status_code,
+                    current.error_code or "TASK_FAILED",
+                    current.error_message or "任务执行失败",
+                    current.error_details or {},
+                )
+            if loop.time() >= deadline:
+                raise ApiError(504, "TASK_WAIT_TIMEOUT", "等待任务结果超时，任务可能仍在后台执行")
+            await asyncio.sleep(0.2)
+            refreshed = await self.repository.get_task(current.id, current.account)
+            if refreshed is None:
+                raise ApiError(404, "TASK_NOT_FOUND", "任务不存在")
+            current = refreshed
 
     async def submit_verification_code(self, task_id: str, account: str, code: str) -> None:
         task = await self.get_for_account(task_id, account)
@@ -279,7 +372,16 @@ class TaskService:
             and updated.operation == TaskOperation.LOGIN.value
         ):
             Path(updated.payload["temporary_cookie_path"]).unlink(missing_ok=True)
+        if (
+            updated.status == TaskStatus.CANCELLED.value
+            and updated.operation == TaskOperation.UPLOAD_MATERIALS.value
+        ):
+            from app.src.services.materials import MaterialService
+
+            MaterialService.cleanup_staged(updated.payload)
         await self.verification.cancel(task_id)
         if self.worker is not None:
             self.worker.cancel_running(task_id)
+        if self.material_worker is not None:
+            self.material_worker.cancel_running(task_id)
         return updated

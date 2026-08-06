@@ -3,8 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
-
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 AccountName = Annotated[
     str,
@@ -49,6 +55,10 @@ class LoginRequest(BaseModel):
         ),
         examples=["sessionid=example; sid_tt=example"],
     )
+    callback_url: AnyHttpUrl | None = Field(
+        default=None,
+        description="可选回调地址；提供后接口立即返回任务 ID，结果通过 HTTP POST 回调",
+    )
 
 
 class CheckRequest(BaseModel):
@@ -87,6 +97,10 @@ class VideoPublishRequest(BaseModel):
         default=None,
         description="可选的抖音自主声明，必须与平台界面中的声明文案完全一致",
     )
+    callback_url: AnyHttpUrl | None = Field(
+        default=None,
+        description="可选回调地址；提供后异步推送验证码等待和最终结果",
+    )
 
     @field_validator("tags")
     @classmethod
@@ -114,7 +128,7 @@ class VideoPublishRequest(BaseModel):
         return value.strip() or None
 
     @model_validator(mode="after")
-    def validate_product_pair(self) -> "VideoPublishRequest":
+    def validate_product_pair(self) -> VideoPublishRequest:
         if bool(self.product_link.strip()) != bool(self.product_title.strip()):
             raise ValueError("product_link 和 product_title 必须同时提供或同时为空")
         return self
@@ -139,6 +153,10 @@ class NotePublishRequest(BaseModel):
         examples=["2026-08-08T20:30:00+08:00"],
     )
     bgm: str = Field(default="", description="可选的抖音背景音乐搜索关键词")
+    callback_url: AnyHttpUrl | None = Field(
+        default=None,
+        description="可选回调地址；提供后异步推送验证码等待和最终结果",
+    )
 
     @field_validator("tags")
     @classmethod

@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 def _positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -13,6 +15,14 @@ def _positive_int(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +51,13 @@ class Settings:
     debug: bool = False
     headless: bool = True
     shipin_headless: bool = True
+    douyin_proxy_enabled: bool = False
+    kdl_secret_id: str | None = None
+    kdl_signature: str | None = None
+    kdl_secret_key: str | None = None
+    kdl_user_name: str | None = None
+    kdl_user_pwd: str | None = None
+    kdl_proxy_auth_mode: str = "basic"
 
     @property
     def cookies_dir(self) -> Path:
@@ -64,6 +81,10 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        load_dotenv(
+            dotenv_path=Path(__file__).resolve().parents[2] / ".env",
+            override=False,
+        )
         default_data_dir = Path(__file__).resolve().parents[1] / "data"
         data_dir = Path(os.getenv("SAU_API_DATA_DIR", default_data_dir)).expanduser().resolve()
         database_url = os.getenv("SAU_API_DATABASE_URL", f"sqlite+aiosqlite:///{data_dir / 'app.db'}")
@@ -101,6 +122,18 @@ class Settings:
             headless=os.getenv("SAU_API_HEADLESS", "true").lower() not in {"0", "false", "no"},
             shipin_headless=os.getenv("SAU_API_SHIPIN_HEADLESS", "true").lower()
             not in {"0", "false", "no"},
+            douyin_proxy_enabled=os.getenv(
+                "SAU_API_DOUYIN_PROXY_ENABLED", "false"
+            ).lower()
+            in {"1", "true", "yes"},
+            kdl_secret_id=_optional_env("KDL_SECRET_ID"),
+            kdl_signature=_optional_env("KDL_SIGNATURE"),
+            kdl_secret_key=_optional_env("KDL_SECRET_KEY"),
+            kdl_user_name=_optional_env("KDL_USER_NAME"),
+            kdl_user_pwd=_optional_env("KDL_USER_PWD"),
+            kdl_proxy_auth_mode=os.getenv("KDL_PROXY_AUTH_MODE", "basic")
+            .strip()
+            .lower(),
         )
 
     def with_overrides(self, **changes) -> Settings:

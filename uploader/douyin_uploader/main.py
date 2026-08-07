@@ -6,6 +6,7 @@ import inspect
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -27,6 +28,37 @@ DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+async def _launch_douyin_browser(
+    playwright: Playwright,
+    *,
+    headless: bool,
+    proxy: dict[str, str] | None = None,
+    cdp_url: str | None = None,
+    args: list[str] | None = None,
+):
+    """统一创建抖音浏览器；代理只适用于本地启动的 Chromium。"""
+    if cdp_url:
+        if proxy:
+            raise ValueError("cdp_url 与 proxy 不能同时使用：CDP 浏览器的代理必须在远端启动时配置")
+        return await playwright.chromium.connect_over_cdp(cdp_url)
+
+    launch_kwargs: dict[str, Any] = {
+        "headless": headless,
+        "channel": "chromium",
+    }
+    if args:
+        launch_kwargs["args"] = args
+    if proxy:
+        # 仅复制 Playwright 支持的字段，避免调用方后续修改影响正在运行的任务。
+        launch_kwargs["proxy"] = dict(proxy)
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception:
+        if proxy:
+            raise RuntimeError("抖音浏览器启动失败：代理连接不可用，代理凭据已隐藏") from None
+        raise
 
 
 async def _emit_qrcode_callback(qrcode_callback, payload: dict):
@@ -63,7 +95,11 @@ async def _read_verify_code(code_file: str) -> str:
         return ""
 
 
-async def cookie_auth(account_file, headless: bool | None = None):
+async def cookie_auth(
+    account_file,
+    headless: bool | None = None,
+    proxy: dict[str, str] | None = None,
+):
     # 抖音无头会撞反爬墙→content/upload 跳登录→误判 cookie 失效（间歇性）。校验必须有头。
     # 即便有头，页面慢/瞬时跳转仍会让 wait_for_url(精确URL,5s) 误判→重试3次+宽松判定(URL含 content/upload 且无登录文案)。
     # 允许 linux server 用户通过 env var 强制无头: DOUYIN_COOKIE_AUTH_HEADLESS=true
@@ -72,14 +108,14 @@ async def cookie_auth(account_file, headless: bool | None = None):
         if headless is None
         else headless
     )
-    launch_kwargs = {
-        "headless": use_headless,
-        "channel": "chromium",
-        "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-    }
     for _attempt in range(3):
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(**launch_kwargs)
+            browser = await _launch_douyin_browser(
+                playwright,
+                headless=use_headless,
+                proxy=proxy,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
             try:
                 context = await browser.new_context(storage_state=account_file)
                 context = await set_init_script(context)
@@ -96,13 +132,33 @@ async def cookie_auth(account_file, headless: bool | None = None):
     return False
 
 
-async def douyin_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
-    if not os.path.exists(account_file) or not await cookie_auth(account_file, headless=headless):
+async def douyin_setup(
+    account_file,
+    handle=False,
+    return_detail=False,
+    qrcode_callback=None,
+    headless: bool = LOCAL_CHROME_HEADLESS,
+    cdp_url: str | None = None,
+    proxy: dict[str, str] | None = None,
+):
+    if cdp_url and proxy:
+        raise ValueError("cdp_url 与 proxy 不能同时使用：CDP 浏览器的代理必须在远端启动时配置")
+    if not os.path.exists(account_file) or not await cookie_auth(
+        account_file,
+        headless=headless,
+        proxy=proxy,
+    ):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
             return result if return_detail else False
         douyin_logger.info(_msg("🥹", "cookie 失效了，准备打开浏览器重新登录"))
-        result = await douyin_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless, cdp_url=cdp_url)
+        result = await douyin_cookie_gen(
+            account_file,
+            qrcode_callback=qrcode_callback,
+            headless=headless,
+            cdp_url=cdp_url,
+            proxy=proxy,
+        )
         return result if return_detail else result["success"]
 
     result = _build_login_result(True, "cookie_valid", "cookie有效", account_file)
@@ -232,14 +288,19 @@ async def douyin_cookie_gen(
     max_checks: int = 60,
     headless: bool = LOCAL_CHROME_HEADLESS,
     cdp_url: str | None = None,
+    proxy: dict[str, str] | None = None,
 ):
     async with async_playwright() as playwright:
+        browser = await _launch_douyin_browser(
+            playwright,
+            headless=headless,
+            proxy=proxy,
+            cdp_url=cdp_url,
+        )
         if cdp_url:
-            browser = await playwright.chromium.connect_over_cdp(cdp_url)
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             should_close_context = False
         else:
-            browser = await playwright.chromium.launch(headless=headless, channel="chromium")
             context = await browser.new_context()
             should_close_context = True
         context = await set_init_script(context)
@@ -262,7 +323,11 @@ async def douyin_cookie_gen(
             if result["success"]:
                 await asyncio.sleep(2)
                 await context.storage_state(path=account_file)
-                if not await cookie_auth(account_file):
+                if not await cookie_auth(
+                    account_file,
+                    headless=headless,
+                    proxy=proxy,
+                ):
                     result = _build_login_result(
                         False,
                         "cookie_invalid",
@@ -295,6 +360,7 @@ class DouYinBaseUploader(BaseVideoUploader):
         progress_callback=None,
         verification_code_provider=None,
         publish_timeout_seconds: int | None = None,
+        proxy: dict[str, str] | None = None,
     ):
         self.publish_date = publish_date
         self.account_file = account_file
@@ -306,6 +372,7 @@ class DouYinBaseUploader(BaseVideoUploader):
         self.progress_callback = progress_callback
         self.verification_code_provider = verification_code_provider
         self.publish_timeout_seconds = publish_timeout_seconds
+        self.proxy = dict(proxy) if proxy else None
         self._deadline: float | None = None
 
     async def emit_progress(self, stage: str, message: str) -> None:
@@ -331,7 +398,11 @@ class DouYinBaseUploader(BaseVideoUploader):
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
             raise RuntimeError(f"cookie文件不存在，请先完成抖音登录: {self.account_file}")
-        if not await cookie_auth(self.account_file, headless=self.headless):
+        if not await cookie_auth(
+            self.account_file,
+            headless=self.headless,
+            proxy=self.proxy,
+        ):
             raise RuntimeError(f"cookie文件已失效，请先完成抖音登录: {self.account_file}")
         if self.publish_strategy not in {DOUYIN_PUBLISH_STRATEGY_IMMEDIATE, DOUYIN_PUBLISH_STRATEGY_SCHEDULED}:
             raise ValueError(f"不支持的发布策略: {self.publish_strategy}")
@@ -609,6 +680,7 @@ class DouYinVideo(DouYinBaseUploader):
         progress_callback=None,
         verification_code_provider=None,
         publish_timeout_seconds: int | None = None,
+        proxy: dict[str, str] | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -619,6 +691,7 @@ class DouYinVideo(DouYinBaseUploader):
             progress_callback=progress_callback,
             verification_code_provider=verification_code_provider,
             publish_timeout_seconds=publish_timeout_seconds,
+            proxy=proxy,
         )
         self.title = title
         self.file_path = file_path
@@ -727,7 +800,11 @@ class DouYinVideo(DouYinBaseUploader):
         context = None
         try:
             await self.emit_progress("launching_browser", "正在启动抖音发布浏览器")
-            browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
+            browser = await _launch_douyin_browser(
+                playwright,
+                headless=self.headless,
+                proxy=self.proxy,
+            )
             context = await browser.new_context(
                 storage_state=f"{self.account_file}",
                 permissions=["geolocation"],
@@ -893,6 +970,7 @@ class DouYinNote(DouYinBaseUploader):
         progress_callback=None,
         verification_code_provider=None,
         publish_timeout_seconds: int | None = None,
+        proxy: dict[str, str] | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -903,6 +981,7 @@ class DouYinNote(DouYinBaseUploader):
             progress_callback=progress_callback,
             verification_code_provider=verification_code_provider,
             publish_timeout_seconds=publish_timeout_seconds,
+            proxy=proxy,
         )
         self.image_paths = image_paths
         self.note = note or ""
@@ -1030,7 +1109,11 @@ class DouYinNote(DouYinBaseUploader):
         context = None
         upload_success = False
         try:
-            browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
+            browser = await _launch_douyin_browser(
+                playwright,
+                headless=self.headless,
+                proxy=self.proxy,
+            )
             context = await browser.new_context(
                 storage_state=f"{self.account_file}",
                 permissions=["geolocation"],

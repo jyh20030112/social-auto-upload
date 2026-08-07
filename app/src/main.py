@@ -106,6 +106,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await container.worker.stop()
                 await container.material_worker.stop()
                 await container.callback_worker.stop()
+            await container.douyin_proxy.aclose()
             await container.database.close()
 
     application = FastAPI(

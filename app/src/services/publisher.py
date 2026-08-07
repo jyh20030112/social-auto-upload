@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from app.src.config import Settings
 from app.src.persistence.repositories import Repository
+from app.src.services.douyin_proxy import DouyinProxyManager
 from sau_cli import (
     DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
     DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
@@ -48,6 +49,30 @@ class _BasePublisherService:
 
 
 class DouyinPublisherService(_BasePublisherService):
+    def __init__(
+        self,
+        settings: Settings,
+        repository: Repository,
+        proxy_manager: DouyinProxyManager | None = None,
+    ) -> None:
+        super().__init__(settings, repository)
+        self.proxy_manager = proxy_manager
+
+    async def _playwright_proxy(
+        self,
+        user_id: str,
+        account: str,
+        minimum_ttl_seconds: int,
+    ) -> dict[str, str] | None:
+        if self.proxy_manager is None or not self.proxy_manager.enabled:
+            return None
+        lease = await self.proxy_manager.acquire(
+            user_id,
+            account,
+            minimum_ttl_seconds=minimum_ttl_seconds,
+        )
+        return lease.playwright_proxy()
+
     async def publish_video(
         self,
         user_id: str,
@@ -74,6 +99,12 @@ class DouyinPublisherService(_BasePublisherService):
                 user_id, payload["thumbnail_portrait_material_id"]
             )
 
+        proxy = await self._playwright_proxy(
+            user_id,
+            account,
+            self.settings.video_timeout_seconds + 300,
+        )
+
         await upload_video(
             DouyinVideoUploadRequest(
                 account_name=account,
@@ -94,6 +125,7 @@ class DouyinPublisherService(_BasePublisherService):
                 progress_callback=progress,
                 verification_code_provider=verification_provider,
                 publish_timeout_seconds=self.settings.video_timeout_seconds,
+                proxy=proxy,
             )
         )
         return {"account": account, "platform": "douyin", "operation": "publish_video"}
@@ -116,6 +148,11 @@ class DouyinPublisherService(_BasePublisherService):
             await self._material_path(user_id, material_id)
             for material_id in payload["image_material_ids"]
         ]
+        proxy = await self._playwright_proxy(
+            user_id,
+            account,
+            self.settings.note_timeout_seconds + 300,
+        )
         await upload_note(
             DouyinNoteUploadRequest(
                 account_name=account,
@@ -132,6 +169,7 @@ class DouyinPublisherService(_BasePublisherService):
                 progress_callback=progress,
                 verification_code_provider=verification_provider,
                 publish_timeout_seconds=self.settings.note_timeout_seconds,
+                proxy=proxy,
             )
         )
         return {"account": account, "platform": "douyin", "operation": "publish_note"}

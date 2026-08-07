@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Sequence
@@ -75,6 +75,7 @@ class DouyinVideoUploadRequest:
     progress_callback: Callable[[str, str], Awaitable[None] | None] | None = None
     verification_code_provider: Callable[[], Awaitable[str]] | None = None
     publish_timeout_seconds: int | None = None
+    proxy: dict[str, str] | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)
@@ -93,6 +94,7 @@ class DouyinNoteUploadRequest:
     progress_callback: Callable[[str, str], Awaitable[None] | None] | None = None
     verification_code_provider: Callable[[], Awaitable[str]] | None = None
     publish_timeout_seconds: int | None = None
+    proxy: dict[str, str] | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)
@@ -317,7 +319,11 @@ def convert_extension_cookies_to_storage_state(raw_json: object) -> dict:
     return {"cookies": converted, "origins": origins}
 
 
-async def _import_douyin_cookie(account_file: Path, cookie_file: Path) -> dict:
+async def _import_douyin_cookie(
+    account_file: Path,
+    cookie_file: Path,
+    proxy: dict[str, str] | None = None,
+) -> dict:
     """Read a browser-extension cookie export, convert + filter to storage_state,
     write it to account_file, and validate with the existing douyin cookie_auth.
     Never falls back to QR login."""
@@ -338,7 +344,7 @@ async def _import_douyin_cookie(account_file: Path, cookie_file: Path) -> dict:
     except OSError as exc:
         return _build_login_result(False, "failed", f"无法写入账号文件: {account_file}（{exc}）", account_file)
 
-    if not await douyin_cookie_auth(str(account_file)):
+    if not await douyin_cookie_auth(str(account_file), proxy=proxy):
         return _build_login_result(
             False,
             "cookie_invalid",
@@ -349,18 +355,32 @@ async def _import_douyin_cookie(account_file: Path, cookie_file: Path) -> dict:
     return _build_login_result(True, "cookie_valid", "cookie 导入成功并通过校验", account_file)
 
 
-async def login_douyin_account(account_name: str, headless: bool = True, cookie_file: Path | None = None) -> dict:
+async def login_douyin_account(
+    account_name: str,
+    headless: bool = True,
+    cookie_file: Path | None = None,
+    proxy: dict[str, str] | None = None,
+) -> dict:
     account_file = resolve_account_file("douyin", account_name)
     if cookie_file is not None:
-        return await _import_douyin_cookie(account_file, cookie_file)
-    return await douyin_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+        return await _import_douyin_cookie(account_file, cookie_file, proxy=proxy)
+    return await douyin_setup(
+        str(account_file),
+        handle=True,
+        return_detail=True,
+        headless=headless,
+        proxy=proxy,
+    )
 
 
-async def check_douyin_account(account_name: str) -> bool:
+async def check_douyin_account(
+    account_name: str,
+    proxy: dict[str, str] | None = None,
+) -> bool:
     account_file = resolve_account_file("douyin", account_name)
     if not account_file.exists():
         return False
-    return await douyin_cookie_auth(str(account_file))
+    return await douyin_cookie_auth(str(account_file), proxy=proxy)
 
 
 async def login_kuaishou_account(account_name: str, headless: bool = True) -> dict:
@@ -558,7 +578,12 @@ async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> Path:
 
 async def upload_video(request: DouyinVideoUploadRequest) -> Path:
     account_file = request.account_file or resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False, headless=request.headless)
+    is_ready = await douyin_setup(
+        str(account_file),
+        handle=False,
+        headless=request.headless,
+        proxy=request.proxy,
+    )
     if not is_ready:
         raise RuntimeError(
             f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
@@ -586,6 +611,7 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
         progress_callback=request.progress_callback,
         verification_code_provider=request.verification_code_provider,
         publish_timeout_seconds=request.publish_timeout_seconds,
+        proxy=request.proxy,
     )
     await app.douyin_upload_video()
     return account_file
@@ -593,7 +619,12 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
 
 async def upload_note(request: DouyinNoteUploadRequest) -> Path:
     account_file = request.account_file or resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False, headless=request.headless)
+    is_ready = await douyin_setup(
+        str(account_file),
+        handle=False,
+        headless=request.headless,
+        proxy=request.proxy,
+    )
     if not is_ready:
         raise RuntimeError(
             f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
@@ -613,6 +644,7 @@ async def upload_note(request: DouyinNoteUploadRequest) -> Path:
         progress_callback=request.progress_callback,
         verification_code_provider=request.verification_code_provider,
         publish_timeout_seconds=request.publish_timeout_seconds,
+        proxy=request.proxy,
     )
     await app.douyin_upload_note()
     return account_file

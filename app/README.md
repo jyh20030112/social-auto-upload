@@ -27,28 +27,29 @@ uv run uvicorn app.src.main:app --host 0.0.0.0 --port 8000 --workers 1
 - `SAU_API_SHIPIN_VIDEO_TIMEOUT_SECONDS`：视频号视频任务超时，默认 `1800` 秒。
 - `SAU_API_SHIPIN_PUBLISH_TIMEOUT_SECONDS`：点击一次“发表”后等待平台确认的超时，默认 `120` 秒。
 - `SAU_API_SHIPIN_CHECK_TIMEOUT_SECONDS`：视频号登录态检查超时，默认 `90` 秒。
-- `SAU_API_DOUYIN_PROXY_ENABLED`：是否为抖音登录、鉴权和发布启用快代理 DPS，默认 `false`。
+- `SAU_API_DOUYIN_PROXY_ENABLED`：是否为抖音登录、鉴权和发布启用快代理 TPS 隧道，默认 `false`。
 - `SAU_API_TERMINAL_RETENTION_DAYS`：终态任务保留天数，默认 `7`。
 
 Swagger 位于 `/docs`，OpenAPI JSON 位于 `/openapi.json`。
 
-## 抖音快代理 DPS
+## 抖音快代理 TPS 隧道
 
-项目支持为每个 `(X-User-ID, account)` 获取并复用一条快代理 DPS 租约，抖音登录、登录态检查、视频发布和图文发布会使用同一套 Playwright 代理参数。复制 `.env.example` 为仓库根目录的 `.env`，填入快代理订单凭据后再配置认证模式：
+项目通过快代理 TPS 接口获取隧道地址，并按 `(X-User-ID, account)` 缓存。抖音登录、登录态检查、视频发布和图文发布都会使用同一套 Playwright 代理参数。TPS 隧道没有 DPS 的单条代理过期时间，因此应用不再根据任务超时申请或校验租约 TTL。复制 `.env.example` 为仓库根目录的 `.env`，填入快代理订单凭据后再配置认证模式：
 
 ```dotenv
 SAU_API_DOUYIN_PROXY_ENABLED=false
 KDL_SECRET_ID=your_secret_id
-KDL_SIGNATURE=your_token
-KDL_SECRET_KEY=
+KDL_SIGNATURE=
+KDL_SECRET_KEY=your_secret_key
 KDL_PROXY_AUTH_MODE=whitelist
 KDL_USER_NAME=
 KDL_USER_PWD=
 ```
 
 - `KDL_SIGNATURE` 是 API token；如果改填 `KDL_SECRET_KEY`，提取接口会使用 HMAC-SHA1 签名。
-- `KDL_PROXY_AUTH_MODE=whitelist` 适合有固定公网出口 IP 的服务器，必须先在快代理订单中加入该 IP。
-- `KDL_PROXY_AUTH_MODE=basic` 会把 `KDL_USER_NAME` 和 `KDL_USER_PWD` 交给 Playwright。当前实测 Chromium 对该代理的 HTTPS CONNECT 返回 `ERR_TUNNEL_CONNECTION_FAILED`，服务器部署优先使用白名单。
+- `KDL_SECRET_ID`/`KDL_SECRET_KEY` 用于调用 TPS 提取接口；控制台中的“API 授权白名单”也只保护该接口。
+- `KDL_PROXY_AUTH_MODE=whitelist` 适合有固定公网出口 IP 的服务器，还必须把该 IP 加入 TPS 订单的“代理访问白名单”。API 授权白名单不能替代代理访问白名单。
+- `KDL_PROXY_AUTH_MODE=basic` 会把 TPS 订单的 `KDL_USER_NAME` 和 `KDL_USER_PWD` 交给 Playwright；它们不是 SecretId/SecretKey。
 - `.env` 已被 Git 忽略；不要把凭据、完整代理地址或 Cookie 写入日志和仓库。
 
 启用前先做只读诊断。它只比较直连/代理出口并打开创作者上传页，不会选择素材、点击发布或改写 Cookie：
@@ -60,9 +61,9 @@ uv run python scripts/diagnose_douyin_proxy.py \
   --json-output /tmp/douyin-proxy-diagnostic.json
 ```
 
-只有诊断返回 `proxy_may_help` 才表示代理路径具备继续灰度测试的条件；其他结论均保持 `SAU_API_DOUYIN_PROXY_ENABLED=false`。诊断 JSON 权限为 `0600`，终端中的出口 IP 会被脱敏。
+只有诊断返回 `proxy_may_help` 才表示代理路径具备继续灰度测试的条件；其他结论均保持 `SAU_API_DOUYIN_PROXY_ENABLED=false`。诊断 JSON 权限为 `0600`，终端中的出口 IP 会被脱敏，并用 `proxy_tunnel.endpoint_acquired` 标记 TPS 隧道地址是否成功获取。
 
-当前 DPS 订单实测租约约为 5—10 分钟，而应用默认要求视频租约至少覆盖 `SAU_API_VIDEO_TIMEOUT_SECONDS + 300` 秒、图文至少覆盖 `SAU_API_NOTE_TIMEOUT_SECONDS + 300` 秒。租约不足时任务会在启动浏览器前明确失败，避免发布途中换 IP。若要正式发布，需要购买/配置更长存活时间的代理产品，或相应缩短业务超时并完成真实素材灰度验证；单纯启用当前短租约不能保证绕过抖音风控。
+隧道地址稳定不代表出口 IP 永远不变。抖音对登录 IP 敏感，TPS 订单应配置足够长的粘性/换 IP 周期，使一次登录检查或发布任务期间出口保持稳定；应用不会在任务中主动调用换 IP。正式启用前仍应使用真实账号和素材灰度验证。
 
 ## 用户隔离
 

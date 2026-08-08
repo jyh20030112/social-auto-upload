@@ -61,6 +61,61 @@ async def _launch_douyin_browser(
         raise
 
 
+async def _locator_is_visible(locator) -> bool:
+    try:
+        return bool(await locator.count()) and bool(await locator.is_visible())
+    except Exception:
+        return False
+
+
+async def _is_douyin_login_page(page: Page) -> bool:
+    """识别仍停留在上传 URL 上的抖音登录页。"""
+    if "/login" in page.url:
+        return True
+
+    login_inputs = (
+        page.locator('input[name="web-login-area-code-input"]').first,
+        page.locator('input[name="normal-input"][placeholder*="手机号"]').first,
+        page.locator('input[name="button-input"][placeholder*="验证码"]').first,
+    )
+    if any([await _locator_is_visible(marker) for marker in login_inputs]):
+        return True
+
+    login_markers = (
+        page.get_by_text("手机号登录", exact=False).first,
+        page.get_by_text("扫码登录", exact=False).first,
+        page.get_by_text("请输入手机号", exact=False).first,
+    )
+    return any([await _locator_is_visible(marker) for marker in login_markers])
+
+
+async def _wait_for_douyin_upload_input(
+    page: Page,
+    *,
+    kind: str,
+    timeout_ms: int = 60000,
+):
+    """等待真实文件框；登录页出现时立即以 Cookie 失效结束。"""
+    selector = "div[class^='container'] input[type='file']"
+    label = "视频"
+    if kind == "image":
+        selector += "[accept*='image']"
+        label = "图片"
+
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    while True:
+        if await _is_douyin_login_page(page):
+            raise RuntimeError("抖音 Cookie 已失效，请重新登录后再发布")
+
+        upload_input = page.locator(selector).first
+        if await upload_input.count():
+            return upload_input
+
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(f"未找到抖音{label}文件上传框")
+        await page.wait_for_timeout(500)
+
+
 async def _emit_qrcode_callback(qrcode_callback, payload: dict):
     if not qrcode_callback:
         return
@@ -101,7 +156,8 @@ async def cookie_auth(
     proxy: dict[str, str] | None = None,
 ):
     # 抖音无头会撞反爬墙→content/upload 跳登录→误判 cookie 失效（间歇性）。校验必须有头。
-    # 即便有头，页面慢/瞬时跳转仍会让 wait_for_url(精确URL,5s) 误判→重试3次+宽松判定(URL含 content/upload 且无登录文案)。
+    # 即便有头，页面慢/瞬时跳转也可能误判，因此重试 3 次，并且必须确认
+    # 真实文件上传框已经挂载；仅 URL 停留在 content/upload 不代表已登录。
     # 允许 linux server 用户通过 env var 强制无头: DOUYIN_COOKIE_AUTH_HEADLESS=true
     use_headless = (
         os.environ.get("DOUYIN_COOKIE_AUTH_HEADLESS", "").lower() in ("1", "true", "yes")
@@ -121,9 +177,12 @@ async def cookie_auth(
                 context = await set_init_script(context)
                 page = await context.new_page()
                 await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
-                await page.wait_for_timeout(2500)  # 等页面稳定，避免瞬时跳转误判
-                has_login = await page.get_by_text("手机号登录").count() or await page.get_by_text("扫码登录").count()
-                if "content/upload" in page.url and not has_login:
+                await _wait_for_douyin_upload_input(
+                    page,
+                    kind="video",
+                    timeout_ms=15000,
+                )
+                if "content/upload" in page.url:
                     return True
             except Exception:
                 pass
@@ -821,8 +880,11 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
             await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
             await self.emit_progress("uploading_material", "正在上传视频素材")
-            await page.wait_for_selector("div[class^='container'] input", state="attached", timeout=60000)
-            await page.locator("div[class^='container'] input").set_input_files(self.file_path)
+            upload_input = await _wait_for_douyin_upload_input(
+                page,
+                kind="video",
+            )
+            await upload_input.set_input_files(self.file_path)
 
             while True:
                 self.check_deadline("等待进入抖音视频发布页超时")
@@ -1023,7 +1085,11 @@ class DouYinNote(DouYinBaseUploader):
 
         await self.emit_progress("uploading_material", "正在上传图片")
         douyin_logger.info(_msg("📤", "小人正在上传图片"))
-        await page.locator("div[class^='container'] input[accept*='image']").set_input_files(self.image_paths)
+        upload_input = await _wait_for_douyin_upload_input(
+            page,
+            kind="image",
+        )
+        await upload_input.set_input_files(self.image_paths)
 
         while True:
             self.check_deadline("等待抖音图片上传完成超时")
@@ -1123,6 +1189,8 @@ class DouYinNote(DouYinBaseUploader):
             await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
             douyin_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
             await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
+
+            await _wait_for_douyin_upload_input(page, kind="video")
 
             await self.upload_note_content(page)
             upload_success = True

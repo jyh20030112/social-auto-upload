@@ -27,6 +27,67 @@ class _AsyncPlaywrightContext:
         return False
 
 
+class _PageLocator:
+    def __init__(self, *, count=0, visible=False, selector=""):
+        self._count = count
+        self._visible = visible
+        self.selector = selector
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return self._count
+
+    async def is_visible(self):
+        return self._visible
+
+
+class _PhoneLoginPage:
+    url = "https://creator.douyin.com/creator-micro/content/upload"
+
+    async def goto(self, *_args, **_kwargs):
+        return None
+
+    async def wait_for_timeout(self, _milliseconds):
+        return None
+
+    def get_by_text(self, _text, **_kwargs):
+        return _PageLocator()
+
+    def locator(self, selector):
+        is_phone_login = (
+            "normal-input" in selector
+            or "button-input" in selector
+            or "请输入手机号" in selector
+            or "请输入验证码" in selector
+        )
+        return _PageLocator(
+            count=1 if is_phone_login else 0,
+            visible=is_phone_login,
+            selector=selector,
+        )
+
+
+class _UploadPage:
+    url = "https://creator.douyin.com/creator-micro/content/upload"
+
+    async def wait_for_timeout(self, _milliseconds):
+        return None
+
+    def get_by_text(self, _text, **_kwargs):
+        return _PageLocator()
+
+    def locator(self, selector):
+        is_file_input = "input[type='file']" in selector
+        return _PageLocator(
+            count=1 if is_file_input else 0,
+            visible=is_file_input,
+            selector=selector,
+        )
+
+
 class DouyinProxyLaunchTests(unittest.TestCase):
     def test_launch_helper_passes_playwright_proxy_copy(self):
         playwright = MagicMock()
@@ -103,6 +164,65 @@ class DouyinProxyLaunchTests(unittest.TestCase):
             )
 
         self.assertEqual(launch.await_args.kwargs["proxy"], PROXY)
+
+    def test_cookie_auth_rejects_phone_login_form_on_upload_url(self):
+        playwright = MagicMock()
+        page = _PhoneLoginPage()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+
+        with (
+            patch.object(
+                douyin_main,
+                "async_playwright",
+                return_value=_AsyncPlaywrightContext(playwright),
+            ),
+            patch.object(
+                douyin_main,
+                "_launch_douyin_browser",
+                AsyncMock(return_value=browser),
+            ),
+            patch.object(
+                douyin_main,
+                "set_init_script",
+                AsyncMock(return_value=context),
+            ),
+        ):
+            valid = asyncio.run(
+                douyin_main.cookie_auth(
+                    "/tmp/cookie.json",
+                    headless=True,
+                    proxy=PROXY,
+                )
+            )
+
+        self.assertFalse(valid)
+
+    def test_upload_input_guard_rejects_phone_login_form(self):
+        page = _PhoneLoginPage()
+
+        with self.assertRaisesRegex(RuntimeError, "Cookie 已失效"):
+            asyncio.run(
+                douyin_main._wait_for_douyin_upload_input(
+                    page,
+                    kind="video",
+                    timeout_ms=100,
+                )
+            )
+
+    def test_upload_input_guard_selects_only_file_input(self):
+        upload_input = asyncio.run(
+            douyin_main._wait_for_douyin_upload_input(
+                _UploadPage(),
+                kind="video",
+                timeout_ms=100,
+            )
+        )
+
+        self.assertIn("input[type='file']", upload_input.selector)
 
     def test_cookie_generation_launches_with_proxy(self):
         playwright = MagicMock()

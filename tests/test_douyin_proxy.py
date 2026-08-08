@@ -1,5 +1,6 @@
 # Language: 中文
 import asyncio
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,10 +29,11 @@ class _AsyncPlaywrightContext:
 
 
 class _PageLocator:
-    def __init__(self, *, count=0, visible=False, selector=""):
+    def __init__(self, *, count=0, visible=False, selector="", text=""):
         self._count = count
         self._visible = visible
         self.selector = selector
+        self._text = text
 
     @property
     def first(self):
@@ -43,6 +45,9 @@ class _PageLocator:
     async def is_visible(self):
         return self._visible
 
+    async def inner_text(self, **_kwargs):
+        return self._text
+
 
 class _PhoneLoginPage:
     url = "https://creator.douyin.com/creator-micro/content/upload"
@@ -53,10 +58,24 @@ class _PhoneLoginPage:
     async def wait_for_timeout(self, _milliseconds):
         return None
 
+    async def title(self):
+        return "抖音创作者中心"
+
+    async def screenshot(self, *, path, full_page):
+        self.screenshot_full_page = full_page
+        Path(path).write_bytes(b"png")
+
     def get_by_text(self, _text, **_kwargs):
         return _PageLocator()
 
     def locator(self, selector):
+        if selector == "body":
+            return _PageLocator(
+                count=1,
+                visible=True,
+                selector=selector,
+                text="手机号登录 请输入手机号 请输入验证码 13800138000",
+            )
         is_phone_login = (
             "normal-input" in selector
             or "button-input" in selector
@@ -174,6 +193,7 @@ class DouyinProxyLaunchTests(unittest.TestCase):
         browser.new_context = AsyncMock(return_value=context)
         browser.close = AsyncMock()
 
+        diagnostics = []
         with (
             patch.object(
                 douyin_main,
@@ -196,10 +216,18 @@ class DouyinProxyLaunchTests(unittest.TestCase):
                     "/tmp/cookie.json",
                     headless=True,
                     proxy=PROXY,
+                    diagnostic_callback=diagnostics.append,
                 )
             )
 
         self.assertFalse(valid)
+        self.assertEqual(len(diagnostics), 3)
+        last = diagnostics[-1]
+        self.assertEqual(last["reason"], "login_required")
+        self.assertEqual(last["final_url"], _PhoneLoginPage.url)
+        self.assertIn("phone_input", last["login_markers"])
+        self.assertEqual(last["upload_input_count"], 0)
+        self.assertNotIn("13800138000", last["visible_text"])
 
     def test_upload_input_guard_rejects_phone_login_form(self):
         page = _PhoneLoginPage()
@@ -223,6 +251,24 @@ class DouyinProxyLaunchTests(unittest.TestCase):
         )
 
         self.assertIn("input[type='file']", upload_input.selector)
+
+    def test_auth_diagnostic_screenshot_is_private_and_text_is_redacted(self):
+        page = _PhoneLoginPage()
+        with tempfile.TemporaryDirectory() as temporary:
+            screenshot = Path(temporary) / "douyin-auth.png"
+            diagnostic = asyncio.run(
+                douyin_main._douyin_auth_diagnostic(
+                    page,
+                    attempt=3,
+                    reason="login_required",
+                    screenshot_path=screenshot,
+                )
+            )
+
+            self.assertEqual(screenshot.read_bytes(), b"png")
+            self.assertEqual(screenshot.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(diagnostic["screenshot_path"], str(screenshot))
+            self.assertNotIn("13800138000", diagnostic["visible_text"])
 
     def test_cookie_generation_launches_with_proxy(self):
         playwright = MagicMock()

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.src.config import Settings
+from app.src.domain.errors import ApiError
 from app.src.persistence.database import Database
 from app.src.persistence.repositories import Repository
 from app.src.persistence.tables import MaterialRecord
@@ -131,6 +132,48 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
             [("user_a", "creator")],
         )
         self.assertEqual(cookie_auth.await_args.kwargs["proxy"], PROXY)
+
+    async def test_account_login_returns_browser_diagnostic_when_cookie_is_invalid(
+        self,
+    ) -> None:
+        service = DouyinAccountService(
+            self.settings,
+            self.repository,
+            BrowserCoordinator(1),
+            self.proxy_manager,
+        )
+        temporary_path = self.settings.temporary_dir / "invalid-cookie.json"
+        temporary_path.write_text("{}", encoding="utf-8")
+        diagnostic = {
+            "attempt": 3,
+            "reason": "login_required",
+            "final_url": "https://creator.douyin.com/creator-micro/content/upload",
+            "login_markers": ["phone_input"],
+            "upload_input_count": 0,
+            "visible_text": "手机号登录 请输入手机号",
+        }
+
+        async def invalid_cookie_auth(*_args, **kwargs):
+            kwargs["diagnostic_callback"](diagnostic)
+            return False
+
+        with patch(
+            "app.src.services.accounts.douyin_cookie_auth",
+            side_effect=invalid_cookie_auth,
+        ):
+            with self.assertRaises(ApiError) as raised:
+                await service.execute_login(
+                    "user_a",
+                    "creator",
+                    str(temporary_path),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "DOUYIN_COOKIE_INVALID")
+        self.assertEqual(
+            raised.exception.details["browser_diagnostic"],
+            diagnostic,
+        )
 
     async def test_video_publish_passes_tunnel_proxy(self) -> None:
         video_path = await self._material("1" * 32, "video.mp4", "video")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 from app.src.config import Settings
+from app.src.domain.errors import ApiError
 from app.src.domain.states import Platform, TaskOperation, TaskStage, TaskStatus
 from app.src.persistence.repositories import Repository
 from app.src.persistence.tables import TaskRecord
@@ -11,6 +13,9 @@ from app.src.services.accounts import DouyinAccountService, ShipinAccountService
 from app.src.services.browser_coordinator import BrowserCoordinator
 from app.src.services.publisher import DouyinPublisherService, ShipinPublisherService
 from app.src.services.verification import VerificationHub
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskWorker:
@@ -165,7 +170,40 @@ class TaskWorker:
                     else "任务执行超时"
                 ),
             )
+        except ApiError as exc:
+            logger.warning(
+                "Browser task rejected: task_id=%s platform=%s account=%s "
+                "code=%s message=%s",
+                task_id,
+                record.platform,
+                record.account,
+                exc.code,
+                exc.message,
+            )
+            latest = await self.repository.get_task(task_id)
+            status = (
+                TaskStatus.INTERRUPTED
+                if latest is not None and latest.may_have_published
+                else TaskStatus.FAILED
+            )
+            await self.repository.finish_task(
+                task_id,
+                status,
+                error_code=exc.code,
+                error_message=exc.message,
+                error_details={
+                    "exception_type": exc.__class__.__name__,
+                    **exc.details,
+                },
+            )
         except Exception as exc:
+            logger.exception(
+                "Browser task failed: task_id=%s platform=%s account=%s",
+                task_id,
+                record.platform,
+                record.account,
+                exc_info=True,
+            )
             latest = await self.repository.get_task(task_id)
             status = (
                 TaskStatus.INTERRUPTED

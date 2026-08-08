@@ -22,6 +22,7 @@ uv run uvicorn app.src.main:app --host 0.0.0.0 --port 8000 --workers 1
 - `SAU_API_MAX_MATERIAL_TASKS`：异步素材处理并发数，默认 `2`。
 - `SAU_API_MAX_CALLBACK_TASKS`：回调投递并发数，默认 `4`。
 - `SAU_API_HEADLESS`：抖音浏览器默认无头运行。
+- `SAU_API_DEBUG`：是否在抖音 Cookie 校验最终失败时保存诊断截图，默认 `false`。
 - `SAU_API_SHIPIN_HEADLESS`：视频号浏览器默认无头运行。
 - `SAU_API_SHIPIN_LOGIN_TIMEOUT_SECONDS`：视频号登录任务超时，默认 `180` 秒。
 - `SAU_API_SHIPIN_VIDEO_TIMEOUT_SECONDS`：视频号视频任务超时，默认 `1800` 秒。
@@ -132,3 +133,9 @@ POST   /api/v1/shipin/video
 ```
 
 Cookie 会先写入临时文件并校验，只有有效时才原子替换已有 Cookie。Cookie 等同于账号登录凭据，部署时应通过 HTTPS 传输，不要写入日志或代码仓库。
+
+## 抖音 Cookie 登录诊断
+
+抖音 Cookie 校验会把每次 Patchright 检查到的脱敏现场写入 `logs/douyin.log`，包括尝试次数、最终 URL（不含查询参数）、页面标题、登录页特征、文件上传框数量、截断后的可见文本和浏览器异常。手机号、Cookie、Token、签名及 URL 中的代理凭据会在写日志和返回 API 前脱敏。
+
+登录失败时接口返回 `409 DOUYIN_COOKIE_INVALID`，`details.browser_diagnostic` 包含最后一次浏览器现场，`details.task_id` 可用于关联任务和日志。设置 `SAU_API_DEBUG=true` 后，只有最后一次失败会在 `app/data/tmp/diagnostics/`（或自定义 `SAU_API_DATA_DIR` 下的对应目录）保存权限为 `0600` 的全页截图；截图可能包含页面信息，应按敏感文件管理并定期清理。

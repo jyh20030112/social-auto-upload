@@ -41,7 +41,14 @@ async def _submit_login(
     response_model=ApiSuccessEnvelope,
     operation_id="douyin_account_login",
     summary="导入抖音 Cookie",
-    responses={202: {"model": ApiSuccessEnvelope}, 422: {"model": ApiErrorEnvelope}},
+    responses={
+        202: {"model": ApiSuccessEnvelope},
+        409: {
+            "model": ApiErrorEnvelope,
+            "description": "Cookie 无法建立有效抖音登录态，并返回脱敏浏览器诊断",
+        },
+        422: {"model": ApiErrorEnvelope},
+    },
 )
 async def douyin_login(
     body: LoginRequest,

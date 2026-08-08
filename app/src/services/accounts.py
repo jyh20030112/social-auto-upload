@@ -121,19 +121,40 @@ class DouyinAccountService:
     ) -> dict:
         temporary_path = Path(temporary_cookie_path)
         permanent_path = self.cookie_path(user_id, account)
+        browser_diagnostics: list[dict] = []
+        screenshot_path = (
+            self.settings.temporary_dir
+            / "diagnostics"
+            / f"{temporary_path.stem}.png"
+            if self.settings.debug
+            else None
+        )
         try:
             proxy = await self._playwright_proxy(user_id, account)
             valid = await douyin_cookie_auth(
                 str(temporary_path),
                 headless=self.settings.headless,
                 proxy=proxy,
+                diagnostic_callback=browser_diagnostics.append,
+                diagnostic_screenshot_path=screenshot_path,
             )
             if not valid:
                 if not permanent_path.exists():
                     await self.repository.upsert_account(
                         user_id, self.platform, account, None, "invalid"
                     )
-                raise RuntimeError("导入的抖音 cookie 已失效或缺少有效登录态")
+                raise ApiError(
+                    409,
+                    "DOUYIN_COOKIE_INVALID",
+                    "导入的抖音 cookie 已失效或缺少有效登录态",
+                    {
+                        "browser_diagnostic": (
+                            browser_diagnostics[-1]
+                            if browser_diagnostics
+                            else {"reason": "no_browser_diagnostic"}
+                        )
+                    },
+                )
             permanent_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(temporary_path, permanent_path)
             os.chmod(permanent_path, 0o600)

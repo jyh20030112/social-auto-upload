@@ -384,12 +384,19 @@ class TaskService:
                         current.error_message or "任务执行被中断，平台端结果可能未知",
                         current.error_details or {},
                     )
-                status_code = 504 if current.error_code == "TASK_TIMEOUT" else 500
+                details = dict(current.error_details or {})
+                details.setdefault("task_id", current.id)
+                if current.error_code == "TASK_TIMEOUT":
+                    status_code = 504
+                elif current.error_code == "DOUYIN_COOKIE_INVALID":
+                    status_code = 409
+                else:
+                    status_code = 500
                 raise ApiError(
                     status_code,
                     current.error_code or "TASK_FAILED",
                     current.error_message or "任务执行失败",
-                    current.error_details or {},
+                    details,
                 )
             if loop.time() >= deadline:
                 raise ApiError(504, "TASK_WAIT_TIMEOUT", "等待任务结果超时，任务可能仍在后台执行")

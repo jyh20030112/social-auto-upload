@@ -3,10 +3,13 @@ from datetime import datetime
 
 import asyncio
 import inspect
+import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -68,25 +71,129 @@ async def _locator_is_visible(locator) -> bool:
         return False
 
 
+def _redact_douyin_auth_text(value: str, limit: int = 300) -> str:
+    normalized = " ".join(value.split())
+    normalized = re.sub(r"(?<!\d)1\d{10}(?!\d)", "1**********", normalized)
+    normalized = re.sub(
+        r"(?i)\b(cookie|sessionid|token|signature)\s*[=:]\s*[^\s,;]+",
+        r"\1=<redacted>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?i)(https?://)([^\s/@:]+):([^\s/@]+)@",
+        r"\1<redacted>:<redacted>@",
+        normalized,
+    )
+    return normalized[:limit]
+
+
+def _sanitize_douyin_page_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    port = f":{parsed.port}" if parsed.port else ""
+    return urlunsplit((parsed.scheme, f"{parsed.hostname}{port}", parsed.path, "", ""))
+
+
+async def _douyin_login_markers(page: Page) -> list[str]:
+    markers: list[str] = []
+    if "/login" in page.url:
+        markers.append("login_url")
+
+    candidates = (
+        (
+            "area_code_input",
+            page.locator('input[name="web-login-area-code-input"]').first,
+        ),
+        (
+            "phone_input",
+            page.locator('input[name="normal-input"][placeholder*="手机号"]').first,
+        ),
+        (
+            "verification_input",
+            page.locator('input[name="button-input"][placeholder*="验证码"]').first,
+        ),
+        ("phone_login_text", page.get_by_text("手机号登录", exact=False).first),
+        ("qrcode_login_text", page.get_by_text("扫码登录", exact=False).first),
+        (
+            "phone_placeholder_text",
+            page.get_by_text("请输入手机号", exact=False).first,
+        ),
+    )
+    for name, locator in candidates:
+        if await _locator_is_visible(locator):
+            markers.append(name)
+    return markers
+
+
 async def _is_douyin_login_page(page: Page) -> bool:
     """识别仍停留在上传 URL 上的抖音登录页。"""
-    if "/login" in page.url:
-        return True
+    return bool(await _douyin_login_markers(page))
 
-    login_inputs = (
-        page.locator('input[name="web-login-area-code-input"]').first,
-        page.locator('input[name="normal-input"][placeholder*="手机号"]').first,
-        page.locator('input[name="button-input"][placeholder*="验证码"]').first,
-    )
-    if any([await _locator_is_visible(marker) for marker in login_inputs]):
-        return True
 
-    login_markers = (
-        page.get_by_text("手机号登录", exact=False).first,
-        page.get_by_text("扫码登录", exact=False).first,
-        page.get_by_text("请输入手机号", exact=False).first,
-    )
-    return any([await _locator_is_visible(marker) for marker in login_markers])
+async def _douyin_auth_diagnostic(
+    page: Page,
+    *,
+    attempt: int,
+    reason: str,
+    error: BaseException | None = None,
+    screenshot_path: str | Path | None = None,
+) -> dict[str, Any]:
+    try:
+        title = _redact_douyin_auth_text(await page.title(), limit=100)
+    except Exception:
+        title = ""
+    try:
+        visible_text = _redact_douyin_auth_text(
+            await page.locator("body").inner_text(timeout=2000)
+        )
+    except Exception:
+        visible_text = ""
+    try:
+        upload_input_count = await page.locator(
+            "div[class^='container'] input[type='file']"
+        ).count()
+    except Exception:
+        upload_input_count = 0
+
+    saved_screenshot = ""
+    screenshot_error = ""
+    if screenshot_path is not None:
+        target = Path(screenshot_path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(target), full_page=True)
+            target.chmod(0o600)
+            saved_screenshot = str(target)
+        except Exception as exc:
+            screenshot_error = exc.__class__.__name__
+
+    return {
+        "attempt": attempt,
+        "reason": reason,
+        "final_url": _sanitize_douyin_page_url(page.url),
+        "title": title,
+        "login_markers": await _douyin_login_markers(page),
+        "upload_input_count": upload_input_count,
+        "visible_text": visible_text,
+        "exception_type": error.__class__.__name__ if error else "",
+        "exception_message": (
+            _redact_douyin_auth_text(str(error), limit=200) if error else ""
+        ),
+        "screenshot_path": saved_screenshot,
+        "screenshot_error": screenshot_error,
+    }
+
+
+async def _emit_auth_diagnostic(callback, diagnostic: dict[str, Any]) -> None:
+    if callback is None:
+        return
+    result = callback(diagnostic)
+    if inspect.isawaitable(result):
+        await result
 
 
 async def _wait_for_douyin_upload_input(
@@ -154,6 +261,8 @@ async def cookie_auth(
     account_file,
     headless: bool | None = None,
     proxy: dict[str, str] | None = None,
+    diagnostic_callback=None,
+    diagnostic_screenshot_path: str | Path | None = None,
 ):
     # 抖音无头会撞反爬墙→content/upload 跳登录→误判 cookie 失效（间歇性）。校验必须有头。
     # 即便有头，页面慢/瞬时跳转也可能误判，因此重试 3 次，并且必须确认
@@ -172,6 +281,7 @@ async def cookie_auth(
                 proxy=proxy,
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
             )
+            page = None
             try:
                 context = await browser.new_context(storage_state=account_file)
                 context = await set_init_script(context)
@@ -183,9 +293,69 @@ async def cookie_auth(
                     timeout_ms=15000,
                 )
                 if "content/upload" in page.url:
+                    diagnostic = await _douyin_auth_diagnostic(
+                        page,
+                        attempt=_attempt + 1,
+                        reason="authenticated",
+                    )
+                    await _emit_auth_diagnostic(diagnostic_callback, diagnostic)
+                    douyin_logger.info(
+                        _msg(
+                            "🔐",
+                            "Cookie 校验通过: "
+                            + json.dumps(diagnostic, ensure_ascii=False),
+                        )
+                    )
                     return True
-            except Exception:
-                pass
+            except Exception as exc:
+                if page is None:
+                    diagnostic = {
+                        "attempt": _attempt + 1,
+                        "reason": "browser_error",
+                        "final_url": "",
+                        "title": "",
+                        "login_markers": [],
+                        "upload_input_count": 0,
+                        "visible_text": "",
+                        "exception_type": exc.__class__.__name__,
+                        "exception_message": _redact_douyin_auth_text(
+                            str(exc), limit=200
+                        ),
+                        "screenshot_path": "",
+                        "screenshot_error": "",
+                    }
+                else:
+                    login_required = await _is_douyin_login_page(page)
+                    upload_input_missing = (
+                        isinstance(exc, RuntimeError)
+                        and "未找到抖音" in str(exc)
+                        and "文件上传框" in str(exc)
+                    )
+                    diagnostic = await _douyin_auth_diagnostic(
+                        page,
+                        attempt=_attempt + 1,
+                        reason=(
+                            "login_required"
+                            if login_required
+                            else (
+                                "upload_input_missing"
+                                if upload_input_missing
+                                else "browser_error"
+                            )
+                        ),
+                        error=exc,
+                        screenshot_path=(
+                            diagnostic_screenshot_path if _attempt == 2 else None
+                        ),
+                    )
+                await _emit_auth_diagnostic(diagnostic_callback, diagnostic)
+                douyin_logger.warning(
+                    _msg(
+                        "🔐",
+                        "Cookie 校验未通过: "
+                        + json.dumps(diagnostic, ensure_ascii=False),
+                    )
+                )
             finally:
                 await browser.close()
     return False

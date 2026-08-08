@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -196,6 +197,41 @@ async def _emit_auth_diagnostic(callback, diagnostic: dict[str, Any]) -> None:
         await result
 
 
+async def _persist_douyin_storage_state(context, account_file: str | Path) -> None:
+    """将浏览器刷新后的登录态原子写回 Cookie 文件。"""
+    target = Path(account_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        await context.storage_state(path=str(temporary_path))
+        payload = json.loads(temporary_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("cookies"), list)
+            or not isinstance(payload.get("origins", []), list)
+        ):
+            raise RuntimeError("Patchright 返回了无效的抖音 storage state")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, target)
+        os.chmod(target, 0o600)
+        douyin_logger.info(
+            _msg(
+                "💾",
+                "已原子保存最新抖音登录态: "
+                f"cookies={len(payload['cookies'])}; "
+                f"origins={len(payload.get('origins', []))}",
+            )
+        )
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 async def _wait_for_douyin_upload_input(
     page: Page,
     *,
@@ -293,6 +329,7 @@ async def cookie_auth(
                     timeout_ms=15000,
                 )
                 if "content/upload" in page.url:
+                    await _persist_douyin_storage_state(context, account_file)
                     diagnostic = await _douyin_auth_diagnostic(
                         page,
                         attempt=_attempt + 1,

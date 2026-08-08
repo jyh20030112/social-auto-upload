@@ -92,6 +92,9 @@ class _PhoneLoginPage:
 class _UploadPage:
     url = "https://creator.douyin.com/creator-micro/content/upload"
 
+    async def goto(self, *_args, **_kwargs):
+        return None
+
     async def wait_for_timeout(self, _milliseconds):
         return None
 
@@ -269,6 +272,108 @@ class DouyinProxyLaunchTests(unittest.TestCase):
             self.assertEqual(screenshot.stat().st_mode & 0o777, 0o600)
             self.assertEqual(diagnostic["screenshot_path"], str(screenshot))
             self.assertNotIn("13800138000", diagnostic["visible_text"])
+
+    def test_cookie_auth_atomically_persists_refreshed_storage_state_on_success(
+        self,
+    ):
+        playwright = MagicMock()
+        page = _UploadPage()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+
+        async def write_refreshed_state(*, path):
+            Path(path).write_text(
+                '{"cookies":[{"name":"refreshed"}],"origins":[]}',
+                encoding="utf-8",
+            )
+
+        context.storage_state = AsyncMock(side_effect=write_refreshed_state)
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie_path = Path(temporary) / "douyin_creator.json"
+            cookie_path.write_text(
+                '{"cookies":[{"name":"original"}],"origins":[]}',
+                encoding="utf-8",
+            )
+            with (
+                patch.object(
+                    douyin_main,
+                    "async_playwright",
+                    return_value=_AsyncPlaywrightContext(playwright),
+                ),
+                patch.object(
+                    douyin_main,
+                    "_launch_douyin_browser",
+                    AsyncMock(return_value=browser),
+                ),
+                patch.object(
+                    douyin_main,
+                    "set_init_script",
+                    AsyncMock(return_value=context),
+                ),
+            ):
+                valid = asyncio.run(
+                    douyin_main.cookie_auth(
+                        cookie_path,
+                        headless=True,
+                        proxy=PROXY,
+                    )
+                )
+
+            self.assertTrue(valid)
+            self.assertIn("refreshed", cookie_path.read_text(encoding="utf-8"))
+            self.assertNotIn("original", cookie_path.read_text(encoding="utf-8"))
+            self.assertEqual(cookie_path.stat().st_mode & 0o777, 0o600)
+            context.storage_state.assert_awaited_once()
+            self.assertEqual(list(Path(temporary).glob(".*.tmp")), [])
+
+    def test_cookie_auth_failure_does_not_overwrite_existing_storage_state(
+        self,
+    ):
+        playwright = MagicMock()
+        page = _PhoneLoginPage()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.storage_state = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie_path = Path(temporary) / "douyin_creator.json"
+            original = '{"cookies":[{"name":"original"}],"origins":[]}'
+            cookie_path.write_text(original, encoding="utf-8")
+            with (
+                patch.object(
+                    douyin_main,
+                    "async_playwright",
+                    return_value=_AsyncPlaywrightContext(playwright),
+                ),
+                patch.object(
+                    douyin_main,
+                    "_launch_douyin_browser",
+                    AsyncMock(return_value=browser),
+                ),
+                patch.object(
+                    douyin_main,
+                    "set_init_script",
+                    AsyncMock(return_value=context),
+                ),
+            ):
+                valid = asyncio.run(
+                    douyin_main.cookie_auth(
+                        cookie_path,
+                        headless=True,
+                        proxy=PROXY,
+                    )
+                )
+
+            self.assertFalse(valid)
+            self.assertEqual(cookie_path.read_text(encoding="utf-8"), original)
+            context.storage_state.assert_not_awaited()
 
     def test_cookie_generation_launches_with_proxy(self):
         playwright = MagicMock()

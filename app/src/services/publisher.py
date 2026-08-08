@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from app.src.config import Settings
 from app.src.persistence.repositories import Repository
 from app.src.services.douyin_proxy import DouyinProxyManager
+from app.src.services.douyin_proxy_policy import require_douyin_playwright_proxy
 from sau_cli import (
     DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
     DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
@@ -62,11 +63,14 @@ class DouyinPublisherService(_BasePublisherService):
         self,
         user_id: str,
         account: str,
-    ) -> dict[str, str] | None:
-        if self.proxy_manager is None or not self.proxy_manager.enabled:
-            return None
-        endpoint = await self.proxy_manager.acquire(user_id, account)
-        return endpoint.playwright_proxy()
+        operation: str,
+    ) -> dict[str, str]:
+        return await require_douyin_playwright_proxy(
+            self.proxy_manager,
+            user_id,
+            account,
+            operation,
+        )
 
     async def publish_video(
         self,
@@ -94,7 +98,7 @@ class DouyinPublisherService(_BasePublisherService):
                 user_id, payload["thumbnail_portrait_material_id"]
             )
 
-        proxy = await self._playwright_proxy(user_id, account)
+        proxy = await self._playwright_proxy(user_id, account, "视频发布")
 
         await upload_video(
             DouyinVideoUploadRequest(
@@ -139,7 +143,7 @@ class DouyinPublisherService(_BasePublisherService):
             await self._material_path(user_id, material_id)
             for material_id in payload["image_material_ids"]
         ]
-        proxy = await self._playwright_proxy(user_id, account)
+        proxy = await self._playwright_proxy(user_id, account, "图文发布")
         await upload_note(
             DouyinNoteUploadRequest(
                 account_name=account,

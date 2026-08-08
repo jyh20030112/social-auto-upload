@@ -48,6 +48,8 @@ async def _publish_response(body, task, reused: bool, request: Request, containe
         404: {"model": ApiErrorEnvelope},
         409: {"model": ApiErrorEnvelope},
         422: {"model": ApiErrorEnvelope},
+        502: {"model": ApiErrorEnvelope},
+        503: {"model": ApiErrorEnvelope},
     },
 )
 async def publish_douyin_video(

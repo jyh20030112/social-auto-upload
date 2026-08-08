@@ -42,6 +42,13 @@ class _FakeProxyManager:
         return _FakeEndpoint()
 
 
+class _DisabledProxyManager:
+    enabled = False
+
+    async def acquire(self, user_id: str, account: str) -> _FakeEndpoint:
+        raise AssertionError(f"disabled proxy must not be acquired: {user_id}/{account}")
+
+
 class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -133,6 +140,33 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(cookie_auth.await_args.kwargs["proxy"], PROXY)
 
+    async def test_account_login_refuses_to_fall_back_to_direct_connection(
+        self,
+    ) -> None:
+        service = DouyinAccountService(
+            self.settings,
+            self.repository,
+            BrowserCoordinator(1),
+            _DisabledProxyManager(),
+        )
+        temporary_path = self.settings.temporary_dir / "login-cookie.json"
+        temporary_path.write_text("{}", encoding="utf-8")
+
+        with patch(
+            "app.src.services.accounts.douyin_cookie_auth",
+            new_callable=AsyncMock,
+        ) as cookie_auth:
+            with self.assertRaises(ApiError) as raised:
+                await service.execute_login(
+                    "user_a",
+                    "creator",
+                    str(temporary_path),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "DOUYIN_PROXY_REQUIRED")
+        cookie_auth.assert_not_awaited()
+
     async def test_account_login_returns_browser_diagnostic_when_cookie_is_invalid(
         self,
     ) -> None:
@@ -206,6 +240,37 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
             self.proxy_manager.calls,
             [("user_a", "creator")],
         )
+
+    async def test_video_publish_refuses_to_fall_back_to_direct_connection(
+        self,
+    ) -> None:
+        await self._material("3" * 32, "video.mp4", "video")
+        service = DouyinPublisherService(
+            self.settings,
+            self.repository,
+            _DisabledProxyManager(),
+        )
+
+        with patch(
+            "app.src.services.publisher.upload_video", new_callable=AsyncMock
+        ) as upload:
+            with self.assertRaises(ApiError) as raised:
+                await service.publish_video(
+                    "user_a",
+                    "creator",
+                    {
+                        "video_material_id": "3" * 32,
+                        "title": "标题",
+                        "description": "描述",
+                        "tags": [],
+                    },
+                    AsyncMock(),
+                    AsyncMock(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "DOUYIN_PROXY_REQUIRED")
+        upload.assert_not_awaited()
 
     async def test_note_publish_passes_tunnel_proxy(self) -> None:
         image_path = await self._material("2" * 32, "image.jpg", "image")

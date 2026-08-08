@@ -28,7 +28,7 @@ uv run uvicorn app.src.main:app --host 0.0.0.0 --port 8000 --workers 1
 - `SAU_API_SHIPIN_VIDEO_TIMEOUT_SECONDS`：视频号视频任务超时，默认 `1800` 秒。
 - `SAU_API_SHIPIN_PUBLISH_TIMEOUT_SECONDS`：点击一次“发表”后等待平台确认的超时，默认 `120` 秒。
 - `SAU_API_SHIPIN_CHECK_TIMEOUT_SECONDS`：视频号登录态检查超时，默认 `90` 秒。
-- `SAU_API_DOUYIN_PROXY_ENABLED`：是否为抖音登录、鉴权和发布启用快代理 TPS 隧道，默认 `false`。
+- `SAU_API_DOUYIN_PROXY_ENABLED`：是否为抖音登录、鉴权和发布启用快代理 TPS 隧道，默认 `false`；关闭时抖音 API 会拒绝这些操作，不会回退直连。
 - `SAU_API_TERMINAL_RETENTION_DAYS`：终态任务保留天数，默认 `7`。
 
 Swagger 位于 `/docs`，OpenAPI JSON 位于 `/openapi.json`。
@@ -52,6 +52,8 @@ KDL_USER_PWD=
 - `KDL_PROXY_AUTH_MODE=whitelist` 适合有固定公网出口 IP 的服务器，还必须把该 IP 加入 TPS 订单的“代理访问白名单”。API 授权白名单不能替代代理访问白名单。
 - `KDL_PROXY_AUTH_MODE=basic` 会把 TPS 订单的 `KDL_USER_NAME` 和 `KDL_USER_PWD` 交给 Playwright；它们不是 SecretId/SecretKey。
 - `.env` 已被 Git 忽略；不要把凭据、完整代理地址或 Cookie 写入日志和仓库。
+
+抖音 API 采用失败关闭策略：登录、登录态检查和发布必须先获得代理，代理关闭时返回 `503 DOUYIN_PROXY_REQUIRED`，代理提取不可用时返回 `502 DOUYIN_PROXY_UNAVAILABLE`；Patchright 使用代理启动或访问失败时也只会终止任务，不会重新启动直连浏览器。每次使用会在 `logs/douyin.log` 输出脱敏 `route_id`；同一用户账号的登录和发布应看到相同的 `route_id`。
 
 启用前先做只读诊断。它只比较直连/代理出口并打开创作者上传页，不会选择素材、点击发布或改写 Cookie：
 

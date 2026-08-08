@@ -47,6 +47,8 @@ async def _submit_login(
             "model": ApiErrorEnvelope,
             "description": "Cookie 无法建立有效抖音登录态，并返回脱敏浏览器诊断",
         },
+        502: {"model": ApiErrorEnvelope, "description": "抖音代理不可用"},
+        503: {"model": ApiErrorEnvelope, "description": "抖音代理未启用"},
         422: {"model": ApiErrorEnvelope},
     },
 )

@@ -12,6 +12,7 @@ from app.src.domain.states import Platform
 from app.src.persistence.repositories import Repository
 from app.src.services.browser_coordinator import BrowserCoordinator
 from app.src.services.douyin_proxy import DouyinProxyManager
+from app.src.services.douyin_proxy_policy import require_douyin_playwright_proxy
 from sau_cli import (
     convert_extension_cookies_to_storage_state,
     convert_tencent_cookie_header_to_storage_state,
@@ -81,11 +82,14 @@ class DouyinAccountService:
         self,
         user_id: str,
         account: str,
-    ) -> dict[str, str] | None:
-        if self.proxy_manager is None or not self.proxy_manager.enabled:
-            return None
-        endpoint = await self.proxy_manager.acquire(user_id, account)
-        return endpoint.playwright_proxy()
+        operation: str,
+    ) -> dict[str, str]:
+        return await require_douyin_playwright_proxy(
+            self.proxy_manager,
+            user_id,
+            account,
+            operation,
+        )
 
     def cookie_path(self, user_id: str, account: str) -> Path:
         return self.settings.cookies_dir / user_id / f"douyin_{account}.json"
@@ -130,7 +134,7 @@ class DouyinAccountService:
             else None
         )
         try:
-            proxy = await self._playwright_proxy(user_id, account)
+            proxy = await self._playwright_proxy(user_id, account, "Cookie 登录")
             valid = await douyin_cookie_auth(
                 str(temporary_path),
                 headless=self.settings.headless,
@@ -179,7 +183,7 @@ class DouyinAccountService:
                         "valid": False,
                         "status": "missing",
                     }
-                proxy = await self._playwright_proxy(user_id, account)
+                proxy = await self._playwright_proxy(user_id, account, "登录态检查")
                 valid = await douyin_cookie_auth(
                     str(path),
                     headless=self.settings.headless,

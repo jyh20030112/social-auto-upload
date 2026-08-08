@@ -390,6 +390,10 @@ class TaskService:
                     status_code = 504
                 elif current.error_code == "DOUYIN_COOKIE_INVALID":
                     status_code = 409
+                elif current.error_code == "DOUYIN_PROXY_REQUIRED":
+                    status_code = 503
+                elif current.error_code == "DOUYIN_PROXY_UNAVAILABLE":
+                    status_code = 502
                 else:
                     status_code = 500
                 raise ApiError(

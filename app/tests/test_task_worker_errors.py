@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.src.config import Settings
 from app.src.domain.errors import ApiError
+from app.src.domain.states import TaskStatus
 from app.src.persistence.database import Database
 from app.src.persistence.repositories import Repository
 from app.src.services.browser_coordinator import BrowserCoordinator
@@ -96,3 +97,36 @@ class TaskWorkerErrorTest(unittest.IsolatedAsyncioTestCase):
             raised.exception.details["browser_diagnostic"]["login_markers"],
             ["phone_input"],
         )
+
+    async def test_proxy_required_error_keeps_service_unavailable_status(self) -> None:
+        task = await self.repository.create_task(
+            task_id="f" * 32,
+            user_id="user_a",
+            platform="douyin",
+            account="creator",
+            operation="login",
+            payload={"temporary_cookie_path": "/tmp/invalid-cookie.json"},
+        )
+        self.assertTrue(await self.repository.claim_task(task.id))
+        await self.repository.finish_task(
+            task.id,
+            TaskStatus.FAILED,
+            error_code="DOUYIN_PROXY_REQUIRED",
+            error_message="抖音登录和发布必须通过代理执行，当前代理未启用",
+            error_details={"operation": "Cookie 登录"},
+        )
+        finished = await self.repository.get_task(task.id)
+        service = TaskService(
+            self.settings,
+            self.repository,
+            object(),
+            object(),
+            VerificationHub(),
+        )
+
+        with self.assertRaises(ApiError) as raised:
+            await service.wait_for_result(finished)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "DOUYIN_PROXY_REQUIRED")
+        self.assertEqual(raised.exception.details["task_id"], task.id)

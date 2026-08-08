@@ -72,6 +72,7 @@ class DouyinVideoUploadRequest:
     headless: bool = True
     declaration: str | None = None
     account_file: Path | None = None
+    initial_storage_state_file: Path | None = field(default=None, repr=False)
     progress_callback: Callable[[str, str], Awaitable[None] | None] | None = None
     verification_code_provider: Callable[[], Awaitable[str]] | None = None
     publish_timeout_seconds: int | None = None
@@ -578,16 +579,7 @@ async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> Path:
 
 async def upload_video(request: DouyinVideoUploadRequest) -> Path:
     account_file = request.account_file or resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(
-        str(account_file),
-        handle=False,
-        headless=request.headless,
-        proxy=request.proxy,
-    )
-    if not is_ready:
-        raise RuntimeError(
-            f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
-        )
+    initial_storage_state_file = request.initial_storage_state_file or account_file
 
     app = DouYinVideo(
         request.title,
@@ -612,6 +604,7 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
         verification_code_provider=request.verification_code_provider,
         publish_timeout_seconds=request.publish_timeout_seconds,
         proxy=request.proxy,
+        initial_storage_state_file=initial_storage_state_file,
     )
     await app.douyin_upload_video()
     return account_file

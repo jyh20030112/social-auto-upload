@@ -110,6 +110,17 @@ class _UploadPage:
         )
 
 
+class _PublicLandingPage(_PhoneLoginPage):
+    def get_by_text(self, text, **_kwargs):
+        visible = text in {"创作者登录", "MCN机构登录"}
+        return _PageLocator(count=1 if visible else 0, visible=visible, text=text)
+
+    def locator(self, selector):
+        if selector == "body":
+            return _PageLocator(count=1, visible=True, text="创作者登录 MCN机构登录")
+        return _PageLocator()
+
+
 class DouyinProxyLaunchTests(unittest.TestCase):
     def test_launch_helper_passes_playwright_proxy_copy(self):
         playwright = MagicMock()
@@ -445,6 +456,7 @@ class DouyinProxyLaunchTests(unittest.TestCase):
             asyncio.run(uploader.upload(MagicMock()))
 
         self.assertEqual(launch.await_args.kwargs["proxy"], PROXY)
+        uploader.validate_upload_args.assert_awaited_once_with(check_cookie=False)
 
     def test_note_upload_launches_with_proxy(self):
         uploader = DouYinNote(
@@ -484,10 +496,11 @@ class DouyinProxyCliTests(unittest.TestCase):
         self.assertNotIn(PROXY["username"], representation)
         self.assertNotIn(PROXY["password"], representation)
 
-    def test_upload_video_passes_same_proxy_to_check_and_uploader(self):
+    def test_upload_video_uses_one_uploader_context_without_preflight_browser(self):
         request = sau_cli.DouyinVideoUploadRequest(
             account_name="creator",
             account_file=Path("/tmp/cookie.json"),
+            initial_storage_state_file=Path("/tmp/inline-cookie.json"),
             video_file=Path("/tmp/video.mp4"),
             title="标题",
             description="正文",
@@ -504,8 +517,17 @@ class DouyinProxyCliTests(unittest.TestCase):
         ):
             asyncio.run(sau_cli.upload_video(request))
 
-        self.assertEqual(setup.await_args.kwargs["proxy"], PROXY)
+        setup.assert_not_awaited()
         self.assertEqual(uploader_class.call_args.kwargs["proxy"], PROXY)
+        self.assertEqual(
+            uploader_class.call_args.kwargs["initial_storage_state_file"],
+            Path("/tmp/inline-cookie.json"),
+        )
+
+    def test_public_creator_landing_is_detected_as_login_page(self):
+        markers = asyncio.run(douyin_main._douyin_login_markers(_PublicLandingPage()))
+        self.assertIn("creator_login_text", markers)
+        self.assertIn("mcn_login_text", markers)
 
     def test_login_and_check_pass_proxy_to_uploader_layer(self):
         with (

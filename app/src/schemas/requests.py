@@ -89,6 +89,17 @@ class ShipinLoginRequest(BaseModel):
 
 class VideoPublishRequest(BaseModel):
     account: AccountName
+    cookie: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=8 * 1024 * 1024,
+        repr=False,
+        description=(
+            "可选抖音 Cookie；提供后将在同一个代理浏览器会话中完成登录校验和发布。"
+            "支持原始 Cookie、Cookie-Editor JSON 或 Playwright storage_state JSON"
+        ),
+        examples=["sessionid=example; sid_tt=example"],
+    )
     video_material_id: HexId = Field(description="通过素材上传接口获得的视频素材 ID")
     title: str = Field(min_length=1, max_length=30, description="视频标题，最多 30 个字符")
     description: str = Field(default="", description="视频文案/描述")

@@ -169,9 +169,18 @@ class TaskService:
         request: VideoPublishRequest | ShipinVideoPublishRequest,
         idempotency_key: str,
     ) -> tuple[TaskRecord, bool]:
-        self._require_account_cookie(user_id, platform.value, request.account)
         payload = request.model_dump(mode="json")
-        request_hash = canonical_request_hash(payload)
+        inline_cookie = payload.pop("cookie", None)
+        if inline_cookie is not None and platform != Platform.DOUYIN:
+            raise ApiError(422, "INLINE_COOKIE_UNSUPPORTED", "当前平台不支持发布时导入 Cookie")
+        if inline_cookie is None:
+            self._require_account_cookie(user_id, platform.value, request.account)
+        hash_payload = dict(payload)
+        if inline_cookie is not None:
+            hash_payload["cookie_sha256"] = hashlib.sha256(
+                inline_cookie.encode("utf-8")
+            ).hexdigest()
+        request_hash = canonical_request_hash(hash_payload)
         existing = await self._idempotent_existing(
             user_id,
             platform.value,
@@ -192,6 +201,13 @@ class TaskService:
             if material_id:
                 await self._validate_material(user_id, material_id, "image")
                 material_ids.append(material_id)
+        task_id = uuid4().hex
+        temporary_path: Path | None = None
+        if inline_cookie is not None:
+            temporary_path = self.douyin_accounts.prepare_login_cookie(
+                task_id, inline_cookie
+            )
+            payload["temporary_cookie_path"] = str(temporary_path)
         return await self._create_publish_task(
             user_id,
             platform.value,
@@ -201,6 +217,8 @@ class TaskService:
             material_ids,
             idempotency_key,
             request_hash,
+            task_id=task_id,
+            cleanup_paths=[temporary_path] if temporary_path else [],
         )
 
     async def submit_note(
@@ -246,10 +264,14 @@ class TaskService:
         material_ids: list[str],
         idempotency_key: str,
         request_hash: str,
+        *,
+        task_id: str | None = None,
+        cleanup_paths: list[Path] | None = None,
     ) -> tuple[TaskRecord, bool]:
+        cleanup_paths = cleanup_paths or []
         try:
             task = await self.repository.create_task(
-                task_id=uuid4().hex,
+                task_id=task_id or uuid4().hex,
                 user_id=user_id,
                 platform=platform,
                 account=account,
@@ -261,6 +283,8 @@ class TaskService:
             )
             return task, False
         except IntegrityError:
+            for path in cleanup_paths:
+                path.unlink(missing_ok=True)
             existing = await self._idempotent_existing(
                 user_id,
                 platform,
@@ -272,6 +296,10 @@ class TaskService:
             if existing is None:
                 raise
             return existing, True
+        except BaseException:
+            for path in cleanup_paths:
+                path.unlink(missing_ok=True)
+            raise
 
     async def get_for_user(self, task_id: str, user_id: str) -> TaskRecord:
         task = await self.repository.get_task(task_id, user_id)
@@ -426,8 +454,10 @@ class TaskService:
         updated = await self.repository.request_task_cancel(task_id, user_id)
         if updated is None:
             raise ApiError(404, "TASK_NOT_FOUND", "任务不存在")
-        if updated.status == TaskStatus.CANCELLED.value and updated.operation == TaskOperation.LOGIN.value:
-            Path(updated.payload["temporary_cookie_path"]).unlink(missing_ok=True)
+        if updated.status == TaskStatus.CANCELLED.value:
+            temporary_cookie_path = updated.payload.get("temporary_cookie_path")
+            if temporary_cookie_path:
+                Path(temporary_cookie_path).unlink(missing_ok=True)
         if (
             updated.status == TaskStatus.CANCELLED.value
             and updated.operation == TaskOperation.UPLOAD_MATERIALS.value

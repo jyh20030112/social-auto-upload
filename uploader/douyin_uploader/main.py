@@ -30,6 +30,14 @@ DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
 
+class DouyinAuthenticationError(RuntimeError):
+    """发布会话没有到达可上传状态，并携带已脱敏的页面诊断。"""
+
+    def __init__(self, message: str, diagnostic: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
 
@@ -123,6 +131,8 @@ async def _douyin_login_markers(page: Page) -> list[str]:
             "phone_placeholder_text",
             page.get_by_text("请输入手机号", exact=False).first,
         ),
+        ("creator_login_text", page.get_by_text("创作者登录", exact=False).first),
+        ("mcn_login_text", page.get_by_text("MCN机构登录", exact=False).first),
     )
     for name, locator in candidates:
         if await _locator_is_visible(locator):
@@ -627,9 +637,11 @@ class DouYinBaseUploader(BaseVideoUploader):
         verification_code_provider=None,
         publish_timeout_seconds: int | None = None,
         proxy: dict[str, str] | None = None,
+        initial_storage_state_file: str | Path | None = None,
     ):
         self.publish_date = publish_date
         self.account_file = account_file
+        self.initial_storage_state_file = str(initial_storage_state_file or account_file)
         self.publish_strategy = publish_strategy
         self.debug = debug
         self.date_format = "%Y年%m月%d日 %H:%M"
@@ -661,15 +673,19 @@ class DouYinBaseUploader(BaseVideoUploader):
             return await self.verification_code_provider()
         return await _read_verify_code(code_file)
 
-    async def validate_base_args(self):
-        if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成抖音登录: {self.account_file}")
-        if not await cookie_auth(
-            self.account_file,
+    async def validate_base_args(self, *, check_cookie: bool = True):
+        if not os.path.exists(self.initial_storage_state_file):
+            raise RuntimeError(
+                f"cookie文件不存在，请先完成抖音登录: {self.initial_storage_state_file}"
+            )
+        if check_cookie and not await cookie_auth(
+            self.initial_storage_state_file,
             headless=self.headless,
             proxy=self.proxy,
         ):
-            raise RuntimeError(f"cookie文件已失效，请先完成抖音登录: {self.account_file}")
+            raise RuntimeError(
+                f"cookie文件已失效，请先完成抖音登录: {self.initial_storage_state_file}"
+            )
         if self.publish_strategy not in {DOUYIN_PUBLISH_STRATEGY_IMMEDIATE, DOUYIN_PUBLISH_STRATEGY_SCHEDULED}:
             raise ValueError(f"不支持的发布策略: {self.publish_strategy}")
 
@@ -947,6 +963,7 @@ class DouYinVideo(DouYinBaseUploader):
         verification_code_provider=None,
         publish_timeout_seconds: int | None = None,
         proxy: dict[str, str] | None = None,
+        initial_storage_state_file: str | Path | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -958,6 +975,7 @@ class DouYinVideo(DouYinBaseUploader):
             verification_code_provider=verification_code_provider,
             publish_timeout_seconds=publish_timeout_seconds,
             proxy=proxy,
+            initial_storage_state_file=initial_storage_state_file,
         )
         self.title = title
         self.file_path = file_path
@@ -975,8 +993,8 @@ class DouYinVideo(DouYinBaseUploader):
         if not await self.set_self_declaration(page, self.declaration):
             raise RuntimeError(f"自主声明「{self.declaration}」设置失败，拒绝继续发布")
 
-    async def validate_upload_args(self):
-        await self.validate_base_args()
+    async def validate_upload_args(self, *, check_cookie: bool = True):
+        await self.validate_base_args(check_cookie=check_cookie)
         if not self.title or not str(self.title).strip():
             raise ValueError("视频模式下，title 是必须的")
 
@@ -1059,7 +1077,7 @@ class DouYinVideo(DouYinBaseUploader):
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
-        await self.validate_upload_args()
+        await self.validate_upload_args(check_cookie=False)
         douyin_logger.info(_msg("🥳", "上传前检查通过"))
         self.start_deadline(1800)
         browser = None
@@ -1072,7 +1090,7 @@ class DouYinVideo(DouYinBaseUploader):
                 proxy=self.proxy,
             )
             context = await browser.new_context(
-                storage_state=f"{self.account_file}",
+                storage_state=self.initial_storage_state_file,
                 permissions=["geolocation"],
             )
             context = await set_init_script(context)
@@ -1085,12 +1103,37 @@ class DouYinVideo(DouYinBaseUploader):
             )
             douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
             douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
-            await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
             await self.emit_progress("uploading_material", "正在上传视频素材")
-            upload_input = await _wait_for_douyin_upload_input(
-                page,
-                kind="video",
-            )
+            try:
+                upload_input = await _wait_for_douyin_upload_input(
+                    page,
+                    kind="video",
+                )
+            except Exception as exc:
+                diagnostic = await _douyin_auth_diagnostic(
+                    page,
+                    attempt=1,
+                    reason=(
+                        "login_required"
+                        if await _is_douyin_login_page(page)
+                        else "upload_input_missing"
+                    ),
+                    error=exc,
+                )
+                douyin_logger.warning(
+                    _msg(
+                        "🔐",
+                        "发布会话登录态不可用: "
+                        + json.dumps(diagnostic, ensure_ascii=False),
+                    )
+                )
+                raise DouyinAuthenticationError(
+                    "抖音 Cookie 已失效或未形成可发布的登录态",
+                    diagnostic,
+                ) from exc
+
+            await _persist_douyin_storage_state(context, self.account_file)
+            douyin_logger.info(_msg("🔐", "已确认上传页登录态并刷新 Cookie"))
             await upload_input.set_input_files(self.file_path)
 
             while True:
@@ -1114,6 +1157,8 @@ class DouYinVideo(DouYinBaseUploader):
                         douyin_logger.debug(_msg("🧍", "还没进到视频发布页面，小人继续等一会"))
                         await asyncio.sleep(0.5)
 
+            await _persist_douyin_storage_state(context, self.account_file)
+            douyin_logger.info(_msg("🔐", "已进入视频编辑页并刷新 Cookie"))
             await asyncio.sleep(1)
             await self.emit_progress("filling_metadata", "正在填写标题、描述和话题")
             douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
@@ -1178,6 +1223,12 @@ class DouYinVideo(DouYinBaseUploader):
                         if code:
                             sms_prompt_logged = False
                             await self._submit_sms_verify_code(page, sms_input, code, code_file)
+                            await _persist_douyin_storage_state(
+                                context, self.account_file
+                            )
+                            douyin_logger.info(
+                                _msg("🔐", "短信验证完成并刷新 Cookie")
+                            )
                             await self.emit_progress("publishing", "验证码已提交，继续发布")
                         elif not sms_prompt_logged:
                             douyin_logger.warning(_msg("⏳", "等待验证码输入"))
@@ -1201,7 +1252,7 @@ class DouYinVideo(DouYinBaseUploader):
                     await asyncio.sleep(0.5)
 
             await self.emit_progress("persisting_cookie", "正在保存最新 Cookie")
-            await context.storage_state(path=self.account_file)
+            await _persist_douyin_storage_state(context, self.account_file)
             douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             if context is not None:

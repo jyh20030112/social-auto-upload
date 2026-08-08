@@ -13,6 +13,7 @@ from app.src.persistence.tables import MaterialRecord
 from app.src.services.accounts import DouyinAccountService
 from app.src.services.browser_coordinator import BrowserCoordinator
 from app.src.services.publisher import DouyinPublisherService
+from uploader.douyin_uploader.main import DouyinAuthenticationError
 
 
 PROXY = {
@@ -240,6 +241,81 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
             self.proxy_manager.calls,
             [("user_a", "creator")],
         )
+
+    async def test_video_publish_uses_and_cleans_temporary_cookie(self) -> None:
+        await self._material("4" * 32, "video.mp4", "video")
+        temporary_cookie = self.settings.temporary_dir / "inline.cookie.json"
+        temporary_cookie.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+        service = DouyinPublisherService(
+            self.settings, self.repository, self.proxy_manager
+        )
+
+        with patch(
+            "app.src.services.publisher.upload_video", new_callable=AsyncMock
+        ) as upload:
+            await service.publish_video(
+                "user_a",
+                "creator",
+                {
+                    "video_material_id": "4" * 32,
+                    "title": "标题",
+                    "description": "描述",
+                    "tags": [],
+                    "temporary_cookie_path": str(temporary_cookie),
+                },
+                AsyncMock(),
+                AsyncMock(),
+            )
+
+        request = upload.await_args.args[0]
+        self.assertEqual(request.initial_storage_state_file, temporary_cookie)
+        self.assertEqual(
+            request.account_file,
+            self.settings.cookies_dir / "user_a" / "douyin_creator.json",
+        )
+        self.assertFalse(temporary_cookie.exists())
+
+    async def test_video_publish_maps_auth_diagnostic_and_cleans_temporary_cookie(
+        self,
+    ) -> None:
+        await self._material("5" * 32, "video.mp4", "video")
+        temporary_cookie = self.settings.temporary_dir / "invalid.cookie.json"
+        temporary_cookie.write_text(
+            '{"cookies": [], "origins": []}', encoding="utf-8"
+        )
+        diagnostic = {
+            "reason": "login_required",
+            "final_url": "https://creator.douyin.com/creator-micro/content/upload",
+            "login_markers": ["creator_login_text"],
+        }
+        service = DouyinPublisherService(
+            self.settings, self.repository, self.proxy_manager
+        )
+
+        with patch(
+            "app.src.services.publisher.upload_video",
+            new_callable=AsyncMock,
+            side_effect=DouyinAuthenticationError("invalid", diagnostic),
+        ):
+            with self.assertRaises(ApiError) as raised:
+                await service.publish_video(
+                    "user_a",
+                    "creator",
+                    {
+                        "video_material_id": "5" * 32,
+                        "title": "标题",
+                        "description": "描述",
+                        "tags": [],
+                        "temporary_cookie_path": str(temporary_cookie),
+                    },
+                    AsyncMock(),
+                    AsyncMock(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "DOUYIN_COOKIE_INVALID")
+        self.assertEqual(raised.exception.details["browser_diagnostic"], diagnostic)
+        self.assertFalse(temporary_cookie.exists())
 
     async def test_video_publish_refuses_to_fall_back_to_direct_connection(
         self,

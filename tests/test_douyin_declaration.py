@@ -86,6 +86,11 @@ class DouyinDeclarationTests(unittest.TestCase):
 
         with (
             patch.object(douyin_main, "set_init_script", AsyncMock(return_value=context)),
+            patch.object(
+                douyin_main,
+                "_persist_douyin_storage_state",
+                AsyncMock(),
+            ),
             patch.object(douyin_main.asyncio, "sleep", AsyncMock()),
             self.assertRaisesRegex(RuntimeError, "自主声明"),
         ):

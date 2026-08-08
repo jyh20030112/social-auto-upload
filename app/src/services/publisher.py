@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.src.config import Settings
+from app.src.domain.errors import ApiError
 from app.src.persistence.repositories import Repository
 from app.src.services.douyin_proxy import DouyinProxyManager
 from app.src.services.douyin_proxy_policy import require_douyin_playwright_proxy
@@ -21,6 +22,7 @@ from sau_cli import (
     upload_tencent_video,
     upload_video,
 )
+from uploader.douyin_uploader.main import DouyinAuthenticationError
 
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
@@ -100,28 +102,49 @@ class DouyinPublisherService(_BasePublisherService):
 
         proxy = await self._playwright_proxy(user_id, account, "视频发布")
 
-        await upload_video(
-            DouyinVideoUploadRequest(
-                account_name=account,
-                video_file=video,
-                title=payload["title"],
-                description=payload.get("description", ""),
-                tags=payload.get("tags", []),
-                publish_date=schedule,
-                thumbnail_landscape_file=landscape,
-                thumbnail_portrait_file=portrait,
-                product_link=payload.get("product_link", ""),
-                product_title=payload.get("product_title", ""),
-                declaration=payload.get("declaration"),
-                publish_strategy=strategy,
-                debug=self.settings.debug,
-                headless=self.settings.headless,
-                account_file=self.settings.cookies_dir / user_id / f"douyin_{account}.json",
-                progress_callback=progress,
-                verification_code_provider=verification_provider,
-                publish_timeout_seconds=self.settings.video_timeout_seconds,
-                proxy=proxy,
+        temporary_cookie_path = payload.get("temporary_cookie_path")
+        try:
+            await upload_video(
+                DouyinVideoUploadRequest(
+                    account_name=account,
+                    video_file=video,
+                    title=payload["title"],
+                    description=payload.get("description", ""),
+                    tags=payload.get("tags", []),
+                    publish_date=schedule,
+                    thumbnail_landscape_file=landscape,
+                    thumbnail_portrait_file=portrait,
+                    product_link=payload.get("product_link", ""),
+                    product_title=payload.get("product_title", ""),
+                    declaration=payload.get("declaration"),
+                    publish_strategy=strategy,
+                    debug=self.settings.debug,
+                    headless=self.settings.headless,
+                    account_file=(
+                        self.settings.cookies_dir / user_id / f"douyin_{account}.json"
+                    ),
+                    initial_storage_state_file=(
+                        Path(temporary_cookie_path) if temporary_cookie_path else None
+                    ),
+                    progress_callback=progress,
+                    verification_code_provider=verification_provider,
+                    publish_timeout_seconds=self.settings.video_timeout_seconds,
+                    proxy=proxy,
+                )
             )
+        except DouyinAuthenticationError as exc:
+            raise ApiError(
+                409,
+                "DOUYIN_COOKIE_INVALID",
+                "抖音 Cookie 已失效或未形成可发布的登录态",
+                {"browser_diagnostic": exc.diagnostic},
+            ) from exc
+        finally:
+            if temporary_cookie_path:
+                Path(temporary_cookie_path).unlink(missing_ok=True)
+        account_path = self.settings.cookies_dir / user_id / f"douyin_{account}.json"
+        await self.repository.upsert_account(
+            user_id, "douyin", account, str(account_path), "valid"
         )
         return {"account": account, "platform": "douyin", "operation": "publish_video"}
 

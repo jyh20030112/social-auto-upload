@@ -43,6 +43,10 @@ async def _publish_response(body, task, reused: bool, request: Request, containe
     response_model=ApiSuccessEnvelope,
     operation_id="douyin_video",
     summary="发布抖音视频",
+    description=(
+        "可选在请求体中传入 cookie；传入后，服务会在同一个代理浏览器上下文中完成"
+        "登录态确认、视频上传和发布，并在稳定页面跳转后刷新长期 Cookie。"
+    ),
     responses={
         202: {"model": ApiSuccessEnvelope},
         404: {"model": ApiErrorEnvelope},

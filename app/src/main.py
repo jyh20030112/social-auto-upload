@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -96,6 +97,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for task in interrupted:
                 if task.operation == "upload_materials":
                     container.materials.cleanup_staged(task.payload)
+                temporary_cookie_path = task.payload.get("temporary_cookie_path")
+                if temporary_cookie_path:
+                    Path(temporary_cookie_path).unlink(missing_ok=True)
             await container.callback_worker.start()
             await container.material_worker.start()
             await container.worker.start()

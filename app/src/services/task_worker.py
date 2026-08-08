@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from app.src.config import Settings
 from app.src.domain.errors import ApiError
@@ -218,6 +219,9 @@ class TaskWorker:
                 error_details={"exception_type": exc.__class__.__name__},
             )
         finally:
+            temporary_cookie_path = record.payload.get("temporary_cookie_path")
+            if temporary_cookie_path:
+                Path(temporary_cookie_path).unlink(missing_ok=True)
             await self.verification.cancel(task_id)
             self._active_accounts.discard(account_key)
 

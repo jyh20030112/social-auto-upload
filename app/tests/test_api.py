@@ -106,6 +106,9 @@ class PublishingApiTest(unittest.TestCase):
             "content"
         ]["multipart/form-data"]
         self.assertNotIn("account", json.dumps(multipart))
+        video_schema = specification["components"]["schemas"]["VideoPublishRequest"]
+        self.assertIn("cookie", video_schema["properties"])
+        self.assertNotIn("cookie", video_schema["required"])
 
     def test_business_routes_require_valid_user_id(self) -> None:
         missing = self.client.post(f"{DOUYIN}/accounts/check", json={"account": "alice"})
@@ -211,7 +214,9 @@ class PublishingApiTest(unittest.TestCase):
         first = self.client.post(f"{DOUYIN}/video", json=body, headers=headers)
         replay = self.client.post(f"{DOUYIN}/video", json=body, headers=headers)
         self.assertEqual(first.status_code, 202, first.text)
-        self.assertEqual(first.json()["data"]["task_id"], replay.json()["data"]["task_id"])
+        self.assertEqual(
+            first.json()["data"]["task_id"], replay.json()["data"]["task_id"]
+        )
         self.assertTrue(replay.json()["data"]["idempotent_replay"])
         conflict = self.client.post(
             f"{DOUYIN}/video", json={**body, "title": "changed"}, headers=headers
@@ -221,6 +226,59 @@ class PublishingApiTest(unittest.TestCase):
             f"{BASE}/materials/{video['id']}", headers=self.headers()
         )
         self.assertEqual(in_use.status_code, 409)
+
+    def test_douyin_video_accepts_inline_cookie_without_persisting_secret(self) -> None:
+        video = self._upload("user_a", "clip.mp4", b"fake-video", "video/mp4")
+        cookie = "sessionid=inline-secret; sid_tt=another-secret"
+        body = {
+            "account": "alice",
+            "video_material_id": video["id"],
+            "title": "inline cookie publish",
+            "cookie": cookie,
+            "callback_url": "https://callback.example.com/douyin",
+        }
+        headers = self.headers(**{"Idempotency-Key": "inline-cookie-001"})
+
+        first = self.client.post(f"{DOUYIN}/video", json=body, headers=headers)
+        replay = self.client.post(f"{DOUYIN}/video", json=body, headers=headers)
+
+        self.assertEqual(first.status_code, 202, first.text)
+        self.assertEqual(first.json()["data"]["task_id"], replay.json()["data"]["task_id"])
+        task_id = first.json()["data"]["task_id"]
+        temporary_cookie = self.settings.temporary_dir / f"{task_id}.cookie.json"
+        self.assertTrue(temporary_cookie.exists())
+        self.assertEqual(temporary_cookie.stat().st_mode & 0o777, 0o600)
+
+        database_path = Path(
+            self.settings.database_url.removeprefix("sqlite+aiosqlite:///")
+        )
+        database_bytes = database_path.read_bytes()
+        self.assertNotIn(cookie.encode(), database_bytes)
+        self.assertNotIn(b"inline-secret", database_bytes)
+        task_response = self.client.get(
+            f"{BASE}/tasks/{task_id}", headers=self.headers()
+        )
+        self.assertNotIn("inline-secret", task_response.text)
+
+        cancelled = self.client.post(
+            f"{BASE}/tasks/{task_id}/cancel", headers=self.headers()
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertFalse(temporary_cookie.exists())
+
+    def test_douyin_video_still_requires_saved_cookie_without_inline_cookie(self) -> None:
+        video = self._upload("user_a", "clip.mp4", b"fake-video", "video/mp4")
+        response = self.client.post(
+            f"{DOUYIN}/video",
+            headers=self.headers(**{"Idempotency-Key": "no-cookie-001"}),
+            json={
+                "account": "alice",
+                "video_material_id": video["id"],
+                "title": "missing cookie",
+            },
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["error"]["code"], "ACCOUNT_NOT_LOGGED_IN")
 
     def test_shipin_video_uses_common_material_and_has_no_draft_field(self) -> None:
         self._mark_logged_in("user_a", "shipin", "channel_a")

@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,13 +15,12 @@ import httpx
 from app.src.config import Settings
 from app.src.services.douyin_proxy import (
     DouyinProxyManager,
-    KdlDpsProvider,
+    KdlTpsProvider,
     ProxyConfig,
     ProxyConfigurationError,
     ProxyDisabledError,
-    ProxyLease,
+    ProxyEndpoint,
     ProxyProviderError,
-    ProxyTtlError,
 )
 
 
@@ -67,15 +66,14 @@ class ProxyValueTests(unittest.TestCase):
             username="username-value",
             password="password-value",
         )
-        lease = ProxyLease(
-            host="127.0.0.1",
+        endpoint = ProxyEndpoint(
+            host="tunnel.example",
             port=8080,
             username="username-value",
             password="password-value",
-            expires_at=NOW + timedelta(minutes=5),
         )
 
-        rendered = repr(config) + repr(lease)
+        rendered = repr(config) + repr(endpoint)
         for secret in (
             "secret-id-value",
             "signature-value",
@@ -85,23 +83,21 @@ class ProxyValueTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, rendered)
 
-    def test_lease_maps_to_playwright_proxy(self):
-        lease = ProxyLease(
-            host="127.0.0.1",
+    def test_endpoint_maps_to_playwright_proxy(self):
+        endpoint = ProxyEndpoint(
+            host="tunnel.example",
             port=8080,
             username="proxy-user",
             password="proxy-password",
-            expires_at=NOW + timedelta(seconds=420),
         )
         self.assertEqual(
-            lease.playwright_proxy(),
+            endpoint.playwright_proxy(),
             {
-                "server": "http://127.0.0.1:8080",
+                "server": "http://tunnel.example:8080",
                 "username": "proxy-user",
                 "password": "proxy-password",
             },
         )
-        self.assertEqual(lease.remaining_ttl_seconds(NOW), 420)
 
     def test_whitelist_mode_omits_browser_proxy_credentials(self):
         config = ProxyConfig(
@@ -111,16 +107,15 @@ class ProxyValueTests(unittest.TestCase):
             proxy_auth_mode="whitelist",
         )
         config.validate()
-        lease = ProxyLease(
-            host="127.0.0.1",
+        endpoint = ProxyEndpoint(
+            host="tunnel.example",
             port=8080,
             username=None,
             password=None,
-            expires_at=NOW + timedelta(seconds=420),
         )
         self.assertEqual(
-            lease.playwright_proxy(),
-            {"server": "http://127.0.0.1:8080"},
+            endpoint.playwright_proxy(),
+            {"server": "http://tunnel.example:8080"},
         )
 
     def test_unknown_proxy_auth_mode_is_rejected(self):
@@ -134,7 +129,7 @@ class ProxyValueTests(unittest.TestCase):
             config.validate()
 
 
-class KdlDpsProviderTests(unittest.TestCase):
+class KdlTpsProviderTests(unittest.TestCase):
     @staticmethod
     def _config(**overrides) -> ProxyConfig:
         values = {
@@ -147,7 +142,7 @@ class KdlDpsProviderTests(unittest.TestCase):
         values.update(overrides)
         return ProxyConfig(**values)
 
-    def test_token_request_and_relative_ttl_response(self):
+    def test_token_request_and_tunnel_endpoint_response(self):
         captured: dict[str, str] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -157,13 +152,13 @@ class KdlDpsProviderTests(unittest.TestCase):
                 json={
                     "code": 0,
                     "msg": "0",
-                    "data": {"proxy_list": ["192.0.2.10:18888,420"]},
+                    "data": {"proxy_list": ["tunnel.example:15818"]},
                 },
             )
 
-        async def scenario() -> ProxyLease:
+        async def scenario() -> ProxyEndpoint:
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-            provider = KdlDpsProvider(
+            provider = KdlTpsProvider(
                 self._config(),
                 client=client,
                 now=lambda: NOW,
@@ -173,7 +168,7 @@ class KdlDpsProviderTests(unittest.TestCase):
             finally:
                 await client.aclose()
 
-        lease = asyncio.run(scenario())
+        endpoint = asyncio.run(scenario())
         self.assertEqual(
             captured,
             {
@@ -181,26 +176,24 @@ class KdlDpsProviderTests(unittest.TestCase):
                 "sign_type": "token",
                 "num": "1",
                 "format": "json",
-                "f_et": "1",
                 "signature": "secret-token",
             },
         )
-        self.assertEqual(lease.server, "http://192.0.2.10:18888")
-        self.assertEqual(lease.expires_at, NOW + timedelta(seconds=420))
+        self.assertEqual(endpoint.server, "http://tunnel.example:15818")
 
-    def test_whitelist_mode_does_not_put_basic_credentials_in_lease(self):
+    def test_whitelist_mode_does_not_put_basic_credentials_in_endpoint(self):
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
                 json={
                     "code": 0,
-                    "data": {"proxy_list": ["192.0.2.10:18888,420"]},
+                    "data": {"proxy_list": ["tunnel.example:15818"]},
                 },
             )
 
-        async def scenario() -> ProxyLease:
+        async def scenario() -> ProxyEndpoint:
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-            provider = KdlDpsProvider(
+            provider = KdlTpsProvider(
                 self._config(proxy_auth_mode="whitelist"),
                 client=client,
                 now=lambda: NOW,
@@ -210,8 +203,8 @@ class KdlDpsProviderTests(unittest.TestCase):
             finally:
                 await client.aclose()
 
-        lease = asyncio.run(scenario())
-        self.assertEqual(lease.playwright_proxy(), {"server": lease.server})
+        endpoint = asyncio.run(scenario())
+        self.assertEqual(endpoint.playwright_proxy(), {"server": endpoint.server})
 
     def test_secret_key_switches_to_official_hmac_sha1_signature(self):
         captured: dict[str, str] = {}
@@ -220,12 +213,12 @@ class KdlDpsProviderTests(unittest.TestCase):
             captured.update(dict(request.url.params))
             return httpx.Response(
                 200,
-                json={"code": 0, "data": {"proxy_list": ["192.0.2.1:80,600"]}},
+                json={"code": 0, "data": {"proxy_list": ["tunnel.example:15818"]}},
             )
 
         async def scenario() -> None:
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-            provider = KdlDpsProvider(
+            provider = KdlTpsProvider(
                 self._config(secret_key="hmac-key"),
                 client=client,
                 now=lambda: NOW,
@@ -237,7 +230,7 @@ class KdlDpsProviderTests(unittest.TestCase):
 
         asyncio.run(scenario())
         raw = (
-            "GET/api/getdps?f_et=1&format=json&num=1&secret_id=secret-id"
+            "GET/api/gettps?format=json&num=1&secret_id=secret-id"
             "&sign_type=hmacsha1&timestamp=1704067200"
         )
         expected = base64.b64encode(
@@ -253,7 +246,7 @@ class KdlDpsProviderTests(unittest.TestCase):
 
         async def scenario() -> None:
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-            provider = KdlDpsProvider(
+            provider = KdlTpsProvider(
                 self._config(), client=client, now=lambda: NOW
             )
             try:
@@ -269,15 +262,15 @@ class KdlDpsProviderTests(unittest.TestCase):
 
 
 class _FakeProvider:
-    def __init__(self, leases: list[ProxyLease]) -> None:
-        self.leases = leases
+    def __init__(self, endpoints: list[ProxyEndpoint]) -> None:
+        self.endpoints = endpoints
         self.calls = 0
         self.closed = False
 
-    async def fetch(self) -> ProxyLease:
+    async def fetch(self) -> ProxyEndpoint:
         self.calls += 1
         await asyncio.sleep(0)
-        return self.leases.pop(0)
+        return self.endpoints.pop(0)
 
     async def aclose(self) -> None:
         self.closed = True
@@ -295,24 +288,21 @@ class DouyinProxyManagerTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _lease(host: str, ttl: int) -> ProxyLease:
-        return ProxyLease(
+    def _endpoint(host: str) -> ProxyEndpoint:
+        return ProxyEndpoint(
             host=host,
             port=8080,
             username="proxy-user",
             password="proxy-password",
-            expires_at=NOW + timedelta(seconds=ttl),
         )
 
-    def test_same_user_account_reuses_one_lease_under_concurrency(self):
-        async def scenario() -> tuple[ProxyLease, ProxyLease, int]:
-            provider = _FakeProvider([self._lease("192.0.2.1", 600)])
-            manager = DouyinProxyManager(
-                self._config(), provider=provider, now=lambda: NOW
-            )
+    def test_same_user_account_reuses_one_endpoint_under_concurrency(self):
+        async def scenario() -> tuple[ProxyEndpoint, ProxyEndpoint, int]:
+            provider = _FakeProvider([self._endpoint("tunnel.example")])
+            manager = DouyinProxyManager(self._config(), provider=provider)
             first, second = await asyncio.gather(
-                manager.acquire("user-a", "account-a", 300),
-                manager.acquire("user-a", "account-a", 300),
+                manager.acquire("user-a", "account-a"),
+                manager.acquire("user-a", "account-a"),
             )
             return first, second, provider.calls
 
@@ -320,22 +310,28 @@ class DouyinProxyManagerTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertEqual(calls, 1)
 
-    def test_ttl_threshold_rejects_short_new_lease(self):
-        async def scenario() -> None:
-            provider = _FakeProvider([self._lease("192.0.2.1", 299)])
-            manager = DouyinProxyManager(
-                self._config(), provider=provider, now=lambda: NOW
+    def test_different_accounts_cache_endpoints_independently(self):
+        async def scenario() -> tuple[ProxyEndpoint, ProxyEndpoint, int]:
+            provider = _FakeProvider(
+                [
+                    self._endpoint("tunnel-a.example"),
+                    self._endpoint("tunnel-b.example"),
+                ]
             )
-            with self.assertRaises(ProxyTtlError):
-                await manager.acquire("user-a", "account-a", 300)
+            manager = DouyinProxyManager(self._config(), provider=provider)
+            first = await manager.acquire("user-a", "account-a")
+            second = await manager.acquire("user-a", "account-b")
+            return first, second, provider.calls
 
-        asyncio.run(scenario())
+        first, second, calls = asyncio.run(scenario())
+        self.assertNotEqual(first.server, second.server)
+        self.assertEqual(calls, 2)
 
     def test_disabled_manager_does_not_call_provider(self):
         async def scenario() -> None:
             provider = _FakeProvider([])
             manager = DouyinProxyManager(
-                ProxyConfig(enabled=False), provider=provider, now=lambda: NOW
+                ProxyConfig(enabled=False), provider=provider
             )
             with self.assertRaises(ProxyDisabledError):
                 await manager.acquire("user-a", "account-a")

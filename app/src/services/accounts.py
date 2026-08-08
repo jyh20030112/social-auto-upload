@@ -81,16 +81,11 @@ class DouyinAccountService:
         self,
         user_id: str,
         account: str,
-        minimum_ttl_seconds: int,
     ) -> dict[str, str] | None:
         if self.proxy_manager is None or not self.proxy_manager.enabled:
             return None
-        lease = await self.proxy_manager.acquire(
-            user_id,
-            account,
-            minimum_ttl_seconds=minimum_ttl_seconds,
-        )
-        return lease.playwright_proxy()
+        endpoint = await self.proxy_manager.acquire(user_id, account)
+        return endpoint.playwright_proxy()
 
     def cookie_path(self, user_id: str, account: str) -> Path:
         return self.settings.cookies_dir / user_id / f"douyin_{account}.json"
@@ -127,11 +122,7 @@ class DouyinAccountService:
         temporary_path = Path(temporary_cookie_path)
         permanent_path = self.cookie_path(user_id, account)
         try:
-            proxy = await self._playwright_proxy(
-                user_id,
-                account,
-                max(300, self.settings.login_timeout_seconds + 60),
-            )
+            proxy = await self._playwright_proxy(user_id, account)
             valid = await douyin_cookie_auth(
                 str(temporary_path),
                 headless=self.settings.headless,
@@ -167,11 +158,7 @@ class DouyinAccountService:
                         "valid": False,
                         "status": "missing",
                     }
-                proxy = await self._playwright_proxy(
-                    user_id,
-                    account,
-                    max(300, self.settings.check_timeout_seconds + 60),
-                )
+                proxy = await self._playwright_proxy(user_id, account)
                 valid = await douyin_cookie_auth(
                     str(path),
                     headless=self.settings.headless,

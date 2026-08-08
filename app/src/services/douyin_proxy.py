@@ -6,7 +6,7 @@ import hashlib
 import hmac
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.parse import urlsplit
 
@@ -16,8 +16,7 @@ if TYPE_CHECKING:
     from app.src.config import Settings
 
 
-KDL_DPS_ENDPOINT = "https://dps.kdlapi.com/api/getdps"
-_CHINA_TIMEZONE = timezone(timedelta(hours=8))
+KDL_TPS_ENDPOINT = "https://tps.kdlapi.com/api/gettps"
 
 
 class DouyinProxyError(RuntimeError):
@@ -36,10 +35,6 @@ class ProxyProviderError(DouyinProxyError):
     pass
 
 
-class ProxyTtlError(DouyinProxyError):
-    pass
-
-
 @dataclass(frozen=True, slots=True, repr=False)
 class ProxyConfig:
     enabled: bool = False
@@ -49,7 +44,7 @@ class ProxyConfig:
     username: str | None = None
     password: str | None = None
     proxy_auth_mode: str = "basic"
-    api_endpoint: str = KDL_DPS_ENDPOINT
+    api_endpoint: str = KDL_TPS_ENDPOINT
     request_timeout_seconds: float = 10.0
 
     @classmethod
@@ -77,9 +72,7 @@ class ProxyConfig:
             )
         missing = [
             name
-            for name, value in (
-                ("KDL_SECRET_ID", self.secret_id),
-            )
+            for name, value in (("KDL_SECRET_ID", self.secret_id),)
             if not value
         ]
         if self.proxy_auth_mode == "basic":
@@ -114,22 +107,15 @@ class ProxyConfig:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class ProxyLease:
+class ProxyEndpoint:
     host: str
     port: int
     username: str | None
     password: str | None
-    expires_at: datetime
 
     @property
     def server(self) -> str:
         return f"http://{self.host}:{self.port}"
-
-    def remaining_ttl_seconds(self, now: datetime | None = None) -> float:
-        reference = now or datetime.now(timezone.utc)
-        if reference.tzinfo is None:
-            reference = reference.replace(tzinfo=timezone.utc)
-        return max(0.0, (self.expires_at - reference).total_seconds())
 
     def playwright_proxy(self) -> dict[str, str]:
         result = {"server": self.server}
@@ -139,15 +125,14 @@ class ProxyLease:
 
     def __repr__(self) -> str:
         return (
-            "ProxyLease("
+            "ProxyEndpoint("
             f"host={self.host!r}, port={self.port!r}, "
             f"username={'<redacted>' if self.username else None!r}, "
-            f"password={'<redacted>' if self.password else None!r}, "
-            f"expires_at={self.expires_at!r})"
+            f"password={'<redacted>' if self.password else None!r})"
         )
 
 
-class KdlDpsProvider:
+class KdlTpsProvider:
     def __init__(
         self,
         config: ProxyConfig,
@@ -163,34 +148,35 @@ class KdlDpsProvider:
             follow_redirects=False,
         )
 
-    async def fetch(self) -> ProxyLease:
+    async def fetch(self) -> ProxyEndpoint:
         self.config.validate()
-        now = self._normalized_now()
-        params = self._request_params(now)
+        params = self._request_params(self._normalized_now())
         try:
             response = await self._client.get(self.config.api_endpoint, params=params)
         except httpx.HTTPError as exc:
             raise ProxyProviderError(
-                "KDL DPS request failed before receiving a response"
+                "KDL TPS request failed before receiving a response"
             ) from exc
         if response.status_code != 200:
             raise ProxyProviderError(
-                f"KDL DPS request returned HTTP {response.status_code}"
+                f"KDL TPS request returned HTTP {response.status_code}"
             )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise ProxyProviderError("KDL DPS returned invalid JSON") from exc
+            raise ProxyProviderError("KDL TPS returned invalid JSON") from exc
         if not isinstance(payload, Mapping):
-            raise ProxyProviderError("KDL DPS returned an unexpected response")
+            raise ProxyProviderError("KDL TPS returned an unexpected response")
         code = payload.get("code")
         if code not in (0, "0"):
-            raise ProxyProviderError(f"KDL DPS returned error code {code!r}")
+            raise ProxyProviderError(f"KDL TPS returned error code {code!r}")
         data = payload.get("data")
         proxy_list = data.get("proxy_list") if isinstance(data, Mapping) else None
         if not isinstance(proxy_list, list) or len(proxy_list) != 1:
-            raise ProxyProviderError("KDL DPS did not return exactly one proxy")
-        return _parse_proxy_lease(
+            raise ProxyProviderError(
+                "KDL TPS did not return exactly one tunnel endpoint"
+            )
+        return _parse_proxy_endpoint(
             proxy_list[0],
             username=(
                 self.config.username if self.config.proxy_auth_mode == "basic" else None
@@ -198,7 +184,6 @@ class KdlDpsProvider:
             password=(
                 self.config.password if self.config.proxy_auth_mode == "basic" else None
             ),
-            now=now,
         )
 
     async def aclose(self) -> None:
@@ -217,7 +202,6 @@ class KdlDpsProvider:
             "sign_type": self.config.auth_mode,
             "num": 1,
             "format": "json",
-            "f_et": 1,
         }
         if self.config.auth_mode == "token":
             params["signature"] = self.config.signature or ""
@@ -241,14 +225,12 @@ class DouyinProxyManager:
         self,
         config: ProxyConfig,
         *,
-        provider: KdlDpsProvider | None = None,
-        now: Callable[[], datetime] | None = None,
+        provider: KdlTpsProvider | None = None,
     ) -> None:
         config.validate()
         self.config = config
-        self._now = now or (lambda: datetime.now(timezone.utc))
-        self._provider = provider or KdlDpsProvider(config, now=self._now)
-        self._leases: dict[tuple[str, str], ProxyLease] = {}
+        self._provider = provider or KdlTpsProvider(config)
+        self._endpoints: dict[tuple[str, str], ProxyEndpoint] = {}
         self._locks: defaultdict[tuple[str, str], asyncio.Lock] = defaultdict(
             asyncio.Lock
         )
@@ -261,111 +243,67 @@ class DouyinProxyManager:
     def enabled(self) -> bool:
         return self.config.enabled
 
-    async def acquire(
-        self,
-        user_id: str,
-        account: str,
-        minimum_ttl_seconds: int = 300,
-    ) -> ProxyLease:
+    async def acquire(self, user_id: str, account: str) -> ProxyEndpoint:
         if not self.enabled:
             raise ProxyDisabledError("Douyin proxy is disabled")
-        if minimum_ttl_seconds < 0:
-            raise ValueError("minimum_ttl_seconds must not be negative")
 
         key = (user_id, account)
         async with self._locks[key]:
-            now = self._normalized_now()
-            cached = self._leases.get(key)
-            if cached and cached.remaining_ttl_seconds(now) >= minimum_ttl_seconds:
+            cached = self._endpoints.get(key)
+            if cached is not None:
                 return cached
 
-            self._leases.pop(key, None)
-            lease = await self._provider.fetch()
-            remaining = lease.remaining_ttl_seconds(self._normalized_now())
-            if remaining < minimum_ttl_seconds:
-                raise ProxyTtlError(
-                    "KDL DPS lease TTL is too short: "
-                    f"remaining={int(remaining)}s, required={minimum_ttl_seconds}s"
-                )
-            self._leases[key] = lease
-            return lease
+            endpoint = await self._provider.fetch()
+            self._endpoints[key] = endpoint
+            return endpoint
 
     def invalidate(self, user_id: str, account: str) -> None:
-        self._leases.pop((user_id, account), None)
+        self._endpoints.pop((user_id, account), None)
 
     async def aclose(self) -> None:
         await self._provider.aclose()
 
-    def _normalized_now(self) -> datetime:
-        value = self._now()
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
 
-
-def _parse_proxy_lease(
+def _parse_proxy_endpoint(
     item: Any,
     *,
     username: str | None,
     password: str | None,
-    now: datetime,
-) -> ProxyLease:
+) -> ProxyEndpoint:
     endpoint: Any = None
-    expiry: Any = None
     if isinstance(item, str):
-        parts = item.rsplit(",", 1)
-        if len(parts) != 2:
-            raise ProxyProviderError("KDL DPS proxy entry has no expiry value")
-        endpoint, expiry = parts
+        endpoint = item
     elif isinstance(item, Mapping):
         endpoint = item.get("proxy") or item.get("server")
         if not endpoint and item.get("ip") and item.get("port"):
             endpoint = f"{item['ip']}:{item['port']}"
-        expiry = (
-            item.get("expire_time")
-            or item.get("expires_at")
-            or item.get("ttl")
-        )
     if not isinstance(endpoint, str) or not endpoint.strip():
-        raise ProxyProviderError("KDL DPS proxy entry has an invalid endpoint")
-    try:
-        host, port_text = endpoint.strip().rsplit(":", 1)
-        port = int(port_text)
-    except (TypeError, ValueError) as exc:
-        raise ProxyProviderError("KDL DPS proxy entry has an invalid endpoint") from exc
-    if not host or not 1 <= port <= 65535:
-        raise ProxyProviderError("KDL DPS proxy entry has an invalid endpoint")
+        raise ProxyProviderError("KDL TPS tunnel entry has an invalid endpoint")
 
-    expires_at = _parse_expiry(expiry, now)
-    return ProxyLease(
+    endpoint = endpoint.strip()
+    if "://" in endpoint:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ProxyProviderError(
+                "KDL TPS tunnel entry has an invalid endpoint"
+            ) from exc
+    else:
+        try:
+            host, port_text = endpoint.rsplit(":", 1)
+            port = int(port_text)
+        except (TypeError, ValueError) as exc:
+            raise ProxyProviderError(
+                "KDL TPS tunnel entry has an invalid endpoint"
+            ) from exc
+
+    if not host or port is None or not 1 <= port <= 65535:
+        raise ProxyProviderError("KDL TPS tunnel entry has an invalid endpoint")
+    return ProxyEndpoint(
         host=host,
         port=port,
         username=username,
         password=password,
-        expires_at=expires_at,
     )
-
-
-def _parse_expiry(value: Any, now: datetime) -> datetime:
-    if value is None:
-        raise ProxyProviderError("KDL DPS proxy entry has no expiry value")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        numeric = None
-    if numeric is not None:
-        if numeric < 0:
-            raise ProxyProviderError("KDL DPS proxy entry has an invalid expiry value")
-        if numeric >= 1_000_000_000:
-            return datetime.fromtimestamp(numeric, tz=timezone.utc)
-        return now + timedelta(seconds=numeric)
-
-    try:
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ProxyProviderError(
-            "KDL DPS proxy entry has an invalid expiry value"
-        ) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_CHINA_TIMEZONE)
-    return parsed.astimezone(timezone.utc)

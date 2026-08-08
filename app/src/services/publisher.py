@@ -62,16 +62,11 @@ class DouyinPublisherService(_BasePublisherService):
         self,
         user_id: str,
         account: str,
-        minimum_ttl_seconds: int,
     ) -> dict[str, str] | None:
         if self.proxy_manager is None or not self.proxy_manager.enabled:
             return None
-        lease = await self.proxy_manager.acquire(
-            user_id,
-            account,
-            minimum_ttl_seconds=minimum_ttl_seconds,
-        )
-        return lease.playwright_proxy()
+        endpoint = await self.proxy_manager.acquire(user_id, account)
+        return endpoint.playwright_proxy()
 
     async def publish_video(
         self,
@@ -99,11 +94,7 @@ class DouyinPublisherService(_BasePublisherService):
                 user_id, payload["thumbnail_portrait_material_id"]
             )
 
-        proxy = await self._playwright_proxy(
-            user_id,
-            account,
-            self.settings.video_timeout_seconds + 300,
-        )
+        proxy = await self._playwright_proxy(user_id, account)
 
         await upload_video(
             DouyinVideoUploadRequest(
@@ -148,11 +139,7 @@ class DouyinPublisherService(_BasePublisherService):
             await self._material_path(user_id, material_id)
             for material_id in payload["image_material_ids"]
         ]
-        proxy = await self._playwright_proxy(
-            user_id,
-            account,
-            self.settings.note_timeout_seconds + 300,
-        )
+        proxy = await self._playwright_proxy(user_id, account)
         await upload_note(
             DouyinNoteUploadRequest(
                 account_name=account,

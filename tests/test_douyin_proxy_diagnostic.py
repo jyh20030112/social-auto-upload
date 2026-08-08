@@ -221,7 +221,7 @@ class DiagnosticSafetyTests(unittest.TestCase):
             summary=diagnostic.StorageStateSummary(1, 0, 1),
             direct=direct,
             proxy=proxy,
-            lease_ttl_seconds=600,
+            tunnel_endpoint_acquired=True,
         )
 
         stream = io.StringIO()
@@ -233,6 +233,7 @@ class DiagnosticSafetyTests(unittest.TestCase):
         self.assertNotIn("198.51.100.20", output)
         self.assertIn("203.0.*.*", output)
         self.assertIn("198.51.*.*", output)
+        self.assertIn("TPS 隧道端点: acquired", output)
 
     def test_json_output_is_always_mode_0600(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

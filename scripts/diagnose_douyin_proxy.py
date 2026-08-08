@@ -3,8 +3,8 @@
 
 This diagnostic never uploads a file, clicks a publish/login control, persists a
 browser storage state, or prints cookies/proxy credentials.  It deliberately
-uses the project's proxy provider so the test exercises the same lease and
-Playwright configuration as the API service.
+uses the project's proxy provider so the test exercises the same tunnel endpoint
+and Playwright configuration as the API service.
 """
 
 from __future__ import annotations
@@ -396,7 +396,7 @@ async def run_browser_probe(
                     timeout=timeout_ms,
                 )
                 final_url = sanitize_url(creator_page.url)
-                # DPS 带宽低于直连时，创作者中心的前端资源可能在
+                # TPS 隧道带宽低于直连时，创作者中心的前端资源可能在
                 # domcontentloaded 之后数秒才完成挂载。轮询已知状态，避免把
                 # 单纯的页面水合延迟误报为 unknown；诊断仍不会点击或上传。
                 status_deadline = asyncio.get_running_loop().time() + min(
@@ -443,10 +443,9 @@ async def run_browser_probe(
     )
 
 
-async def acquire_proxy_lease(
+async def acquire_proxy_endpoint(
     user_id: str,
     account: str,
-    minimum_ttl_seconds: int = 120,
 ):
     """Acquire through the production provider, while overriding its rollout gate."""
     # Executing a file under scripts/ puts scripts/ (not the repository root) on
@@ -462,15 +461,11 @@ async def acquire_proxy_lease(
     settings = Settings.from_env().with_overrides(douyin_proxy_enabled=True)
     manager = DouyinProxyManager.from_settings(settings)
     try:
-        lease = await manager.acquire(
-            user_id,
-            account,
-            minimum_ttl_seconds=minimum_ttl_seconds,
-        )
+        endpoint = await manager.acquire(user_id, account)
     except Exception:
         await manager.aclose()
         raise
-    return manager, lease
+    return manager, endpoint
 
 
 def build_report(
@@ -478,7 +473,7 @@ def build_report(
     summary: StorageStateSummary,
     direct: ModeProbe,
     proxy: ModeProbe,
-    lease_ttl_seconds: int | None,
+    tunnel_endpoint_acquired: bool,
 ) -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -486,7 +481,10 @@ def build_report(
         "storage_state": asdict(summary),
         "direct": asdict(direct),
         "proxy": asdict(proxy),
-        "proxy_lease_ttl_seconds": lease_ttl_seconds,
+        "proxy_tunnel": {
+            "provider": "kuaidaili_tps",
+            "endpoint_acquired": tunnel_endpoint_acquired,
+        },
     }
 
 
@@ -517,6 +515,14 @@ def print_terminal_report(report: dict[str, Any], json_output: Path | None) -> N
     print(f"代理出口: {proxy_ips or ['<unavailable>']}")
     print(f"直连上传页: {direct['page_status']}")
     print(f"代理上传页: {proxy['page_status']}")
+    print(
+        "TPS 隧道端点: "
+        + (
+            "acquired"
+            if report["proxy_tunnel"]["endpoint_acquired"]
+            else "unavailable"
+        )
+    )
     if direct["ip_errors"] or direct["page_error"]:
         print("直连探测存在错误（详细脱敏信息见 JSON）")
     if proxy["ip_errors"] or proxy["page_error"]:
@@ -545,19 +551,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     manager = None
-    lease_ttl_seconds: int | None = None
+    tunnel_endpoint_acquired = False
     try:
-        diagnostic_minimum_ttl = max(
-            120,
-            args.timeout_seconds + int(args.samples * args.interval) + 30,
-        )
-        manager, lease = await acquire_proxy_lease(
-            args.user_id,
-            account,
-            diagnostic_minimum_ttl,
-        )
-        proxy_config = lease.playwright_proxy()
-        lease_ttl_seconds = max(0, int(lease.remaining_ttl_seconds()))
+        manager, endpoint = await acquire_proxy_endpoint(args.user_id, account)
+        proxy_config = endpoint.playwright_proxy()
+        tunnel_endpoint_acquired = True
         proxy = await run_browser_probe(
             mode="proxy",
             storage_state=args.storage_state,
@@ -583,7 +581,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         summary=summary,
         direct=direct,
         proxy=proxy,
-        lease_ttl_seconds=lease_ttl_seconds,
+        tunnel_endpoint_acquired=tunnel_endpoint_acquired,
     )
 
 

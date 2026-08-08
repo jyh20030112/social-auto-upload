@@ -21,7 +21,7 @@ PROXY = {
 }
 
 
-class _FakeLease:
+class _FakeEndpoint:
     def playwright_proxy(self) -> dict[str, str]:
         return dict(PROXY)
 
@@ -30,16 +30,15 @@ class _FakeProxyManager:
     enabled = True
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, int]] = []
+        self.calls: list[tuple[str, str]] = []
 
     async def acquire(
         self,
         user_id: str,
         account: str,
-        minimum_ttl_seconds: int = 300,
-    ) -> _FakeLease:
-        self.calls.append((user_id, account, minimum_ttl_seconds))
-        return _FakeLease()
+    ) -> _FakeEndpoint:
+        self.calls.append((user_id, account))
+        return _FakeEndpoint()
 
 
 class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
@@ -80,7 +79,7 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         )
         return path
 
-    async def test_account_check_uses_account_proxy_lease(self) -> None:
+    async def test_account_check_uses_account_tunnel_endpoint(self) -> None:
         service = DouyinAccountService(
             self.settings,
             self.repository,
@@ -101,11 +100,11 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["valid"])
         self.assertEqual(
             self.proxy_manager.calls,
-            [("user_a", "creator", 300)],
+            [("user_a", "creator")],
         )
         self.assertEqual(cookie_auth.await_args.kwargs["proxy"], PROXY)
 
-    async def test_account_login_uses_account_proxy_lease(self) -> None:
+    async def test_account_login_uses_account_tunnel_endpoint(self) -> None:
         service = DouyinAccountService(
             self.settings,
             self.repository,
@@ -129,11 +128,11 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "valid")
         self.assertEqual(
             self.proxy_manager.calls,
-            [("user_a", "creator", 300)],
+            [("user_a", "creator")],
         )
         self.assertEqual(cookie_auth.await_args.kwargs["proxy"], PROXY)
 
-    async def test_video_publish_requires_long_lease_and_passes_proxy(self) -> None:
+    async def test_video_publish_passes_tunnel_proxy(self) -> None:
         video_path = await self._material("1" * 32, "video.mp4", "video")
         service = DouyinPublisherService(
             self.settings,
@@ -162,10 +161,10 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.proxy, PROXY)
         self.assertEqual(
             self.proxy_manager.calls,
-            [("user_a", "creator", self.settings.video_timeout_seconds + 300)],
+            [("user_a", "creator")],
         )
 
-    async def test_note_publish_requires_task_length_lease(self) -> None:
+    async def test_note_publish_passes_tunnel_proxy(self) -> None:
         image_path = await self._material("2" * 32, "image.jpg", "image")
         service = DouyinPublisherService(
             self.settings,
@@ -194,7 +193,7 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.proxy, PROXY)
         self.assertEqual(
             self.proxy_manager.calls,
-            [("user_a", "creator", self.settings.note_timeout_seconds + 300)],
+            [("user_a", "creator")],
         )
 
 

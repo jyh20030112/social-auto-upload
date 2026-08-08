@@ -22,7 +22,10 @@ from sau_cli import (
     upload_tencent_video,
     upload_video,
 )
-from uploader.douyin_uploader.main import DouyinAuthenticationError
+from uploader.douyin_uploader.main import (
+    DouyinAuthenticationError,
+    DouyinNavigationError,
+)
 
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
@@ -137,6 +140,13 @@ class DouyinPublisherService(_BasePublisherService):
                 409,
                 "DOUYIN_COOKIE_INVALID",
                 "抖音 Cookie 已失效或未形成可发布的登录态",
+                {"browser_diagnostic": exc.diagnostic},
+            ) from exc
+        except DouyinNavigationError as exc:
+            raise ApiError(
+                504,
+                "DOUYIN_NAVIGATION_TIMEOUT",
+                str(exc),
                 {"browser_diagnostic": exc.diagnostic},
             ) from exc
         finally:

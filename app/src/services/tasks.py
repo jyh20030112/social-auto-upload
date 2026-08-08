@@ -416,6 +416,8 @@ class TaskService:
                 details.setdefault("task_id", current.id)
                 if current.error_code == "TASK_TIMEOUT":
                     status_code = 504
+                elif current.error_code == "DOUYIN_NAVIGATION_TIMEOUT":
+                    status_code = 504
                 elif current.error_code == "DOUYIN_COOKIE_INVALID":
                     status_code = 409
                 elif current.error_code == "DOUYIN_PROXY_REQUIRED":

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
@@ -32,6 +33,14 @@ DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
 class DouyinAuthenticationError(RuntimeError):
     """发布会话没有到达可上传状态，并携带已脱敏的页面诊断。"""
+
+    def __init__(self, message: str, diagnostic: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+class DouyinNavigationError(RuntimeError):
+    """代理浏览器未能在限定时间内提交抖音页面导航。"""
 
     def __init__(self, message: str, diagnostic: dict[str, Any]) -> None:
         super().__init__(message)
@@ -668,6 +677,10 @@ class DouYinBaseUploader(BaseVideoUploader):
         if self._deadline is not None and asyncio.get_running_loop().time() >= self._deadline:
             raise TimeoutError(message)
 
+    def navigation_timeout_ms(self, default_seconds: int) -> int:
+        total_seconds = self.publish_timeout_seconds or default_seconds
+        return max(10_000, min(45_000, total_seconds * 250))
+
     async def read_verification_code(self, code_file: str) -> str:
         if self.verification_code_provider is not None:
             return await self.verification_code_provider()
@@ -1096,10 +1109,44 @@ class DouYinVideo(DouYinBaseUploader):
             context = await set_init_script(context)
 
             page = await context.new_page()
-            await page.goto(
-                "https://creator.douyin.com/creator-micro/content/upload",
-                wait_until="domcontentloaded",
-                timeout=90000,
+            navigation_timeout_ms = self.navigation_timeout_ms(1800)
+            try:
+                navigation_response = await page.goto(
+                    "https://creator.douyin.com/creator-micro/content/upload",
+                    wait_until="commit",
+                    timeout=navigation_timeout_ms,
+                )
+            except PlaywrightTimeoutError as exc:
+                login_required = await _is_douyin_login_page(page)
+                diagnostic = await _douyin_auth_diagnostic(
+                    page,
+                    attempt=1,
+                    reason=("login_required" if login_required else "navigation_timeout"),
+                    error=exc,
+                )
+                douyin_logger.warning(
+                    _msg(
+                        "🌐",
+                        "抖音上传页导航失败: "
+                        + json.dumps(diagnostic, ensure_ascii=False),
+                    )
+                )
+                if login_required:
+                    raise DouyinAuthenticationError(
+                        "抖音 Cookie 已失效或被重定向到登录页",
+                        diagnostic,
+                    ) from exc
+                raise DouyinNavigationError(
+                    f"抖音上传页在 {navigation_timeout_ms / 1000:g} 秒内未返回首个响应",
+                    diagnostic,
+                ) from exc
+            douyin_logger.info(
+                _msg(
+                    "🌐",
+                    "抖音上传页导航已提交: "
+                    f"status={navigation_response.status if navigation_response else 'unknown'}; "
+                    f"url={_sanitize_douyin_page_url(page.url)}",
+                )
             )
             douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
             douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))

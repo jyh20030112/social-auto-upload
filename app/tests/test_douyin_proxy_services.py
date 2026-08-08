@@ -14,6 +14,7 @@ from app.src.services.accounts import DouyinAccountService
 from app.src.services.browser_coordinator import BrowserCoordinator
 from app.src.services.publisher import DouyinPublisherService
 from uploader.douyin_uploader.main import DouyinAuthenticationError
+from uploader.douyin_uploader.main import DouyinNavigationError
 
 
 PROXY = {
@@ -316,6 +317,42 @@ class DouyinProxyServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "DOUYIN_COOKIE_INVALID")
         self.assertEqual(raised.exception.details["browser_diagnostic"], diagnostic)
         self.assertFalse(temporary_cookie.exists())
+
+    async def test_video_publish_maps_navigation_timeout(self) -> None:
+        await self._material("6" * 32, "video.mp4", "video")
+        diagnostic = {
+            "reason": "navigation_timeout",
+            "final_url": "",
+            "login_markers": [],
+        }
+        service = DouyinPublisherService(
+            self.settings, self.repository, self.proxy_manager
+        )
+
+        with patch(
+            "app.src.services.publisher.upload_video",
+            new_callable=AsyncMock,
+            side_effect=DouyinNavigationError(
+                "抖音上传页在 30 秒内未返回首个响应", diagnostic
+            ),
+        ):
+            with self.assertRaises(ApiError) as raised:
+                await service.publish_video(
+                    "user_a",
+                    "creator",
+                    {
+                        "video_material_id": "6" * 32,
+                        "title": "标题",
+                        "description": "描述",
+                        "tags": [],
+                    },
+                    AsyncMock(),
+                    AsyncMock(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(raised.exception.code, "DOUYIN_NAVIGATION_TIMEOUT")
+        self.assertEqual(raised.exception.details["browser_diagnostic"], diagnostic)
 
     async def test_video_publish_refuses_to_fall_back_to_direct_connection(
         self,

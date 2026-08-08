@@ -3,6 +3,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from uploader.douyin_uploader import main as douyin_main
 from uploader.douyin_uploader.main import DouYinVideo
 
@@ -70,7 +72,13 @@ class DouyinDeclarationTests(unittest.TestCase):
         locator.set_input_files = AsyncMock()
         locator.count = AsyncMock(return_value=1)
         page = MagicMock()
-        page.goto = AsyncMock()
+        page.url = "https://creator.douyin.com/creator-micro/content/upload"
+
+        async def goto_times_out_on_domcontentloaded(*_args, **kwargs):
+            if kwargs.get("wait_until") == "domcontentloaded":
+                raise PlaywrightTimeoutError("Timeout 90000ms exceeded")
+
+        page.goto = AsyncMock(side_effect=goto_times_out_on_domcontentloaded)
         page.wait_for_url = AsyncMock()
         page.wait_for_selector = AsyncMock()
         page.locator.return_value = locator
@@ -98,6 +106,8 @@ class DouyinDeclarationTests(unittest.TestCase):
 
         context.close.assert_awaited_once()
         browser.close.assert_awaited_once()
+        self.assertEqual(page.goto.await_args.kwargs["wait_until"], "commit")
+        self.assertEqual(page.goto.await_args.kwargs["timeout"], 45_000)
 
 
 if __name__ == "__main__":
